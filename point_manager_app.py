@@ -26,7 +26,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 TABLE_NAME = "point"
 GEOM_COLUMN = "shape"      # اسم عمود الجيومتري الحقيقي عندك
 PK_COLUMN = "gis_oid"      # عمود المفتاح الأساسي (Primary Key)
-SRID = 4326
+INPUT_SRID = 4326   # نظام الإحداثيات اللي يكتب فيه المستخدم (lat/lng عادي)
+TABLE_SRID = 20438  # ⚠️ SRID الفعلي لعمود shape (تأكد بأمر: SELECT * FROM geometry_columns WHERE f_table_name = 'point';)
 
 # الأعمدة الوصفية اللي تبي تظهر في النموذج (عدّلها/زد عليها حسب جدولك)
 FORM_COLUMNS = [
@@ -86,9 +87,9 @@ def load_data():
 def insert_point(lat, lng, values: dict):
     cols = [GEOM_COLUMN] + list(values.keys())
     col_list = ", ".join(f'"{c}"' for c in cols)
-    val_list = ["ST_SetSRID(ST_MakePoint(:lng, :lat), :srid)"] + [f":{k}" for k in values.keys()]
+    val_list = ["ST_Transform(ST_SetSRID(ST_MakePoint(:lng, :lat), :input_srid), :table_srid)"] + [f":{k}" for k in values.keys()]
     sql = f'INSERT INTO {TABLE_NAME} ({col_list}) VALUES ({", ".join(val_list)})'
-    params = {"lng": lng, "lat": lat, "srid": SRID, **values}
+    params = {"lng": lng, "lat": lat, "input_srid": INPUT_SRID, "table_srid": TABLE_SRID, **values}
     run_async(_execute(sql, params))
 
 
