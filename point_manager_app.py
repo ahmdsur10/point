@@ -1,41 +1,32 @@
 """
-تطبيق إدارة نقاط - Point Manager
-يتصل بجدول 'point' في قاعدة بيانات PostGIS على Neon
-يدعم: إضافة نقطة جديدة / تعديل نقطة موجودة / حذف نقطة / عرض جدول البيانات
+تطبيق إدارة نقاط - Point Manager (نسخة SQLAlchemy Async)
+يتصل بجدول 'point' في قاعدة بيانات PostGIS على Neon باستخدام:
+    - SQLAlchemy Async Engine
+    - psycopg (v3) كـ driver
+    - DATABASE_URL من ملف .env
 
 طريقة التشغيل:
-    1) pip install streamlit psycopg2-binary pandas
-    2) عدّل بيانات الاتصال تحت (أو استخدم secrets.toml - موضح بالأسفل)
+    1) pip install -r requirements.txt
+    2) أنشئ ملف .env بجانب هذا الملف وحط فيه:
+           DATABASE_URL=postgresql://neondb_owner:PASSWORD@ep-steep-bonus-ax7dker6.c-4.us-east-2.aws.neon.tech/point?sslmode=require
     3) streamlit run point_manager_app.py
 """
 
+import os
+import re
+import asyncio
+
 import streamlit as st
-import psycopg2
 import pandas as pd
+from dotenv import load_dotenv
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+load_dotenv()
 
 # =========================================================
-# 1) إعدادات الاتصال بقاعدة البيانات
+# 1) إعداد الاتصال (Async Engine مرة وحدة فقط، مخزن بالـ cache)
 # =========================================================
-# الخيار الأول: تعبي القيم مباشرة هنا (أسهل للتجربة السريعة)
-DB_CONFIG = {
-    "host": "ep-steep-bonus-ax7dker6.c-4.us-east-2.aws.neon.tech",
-    "dbname": "point",
-    "user": "neondb_owner",
-    "password": "ضع_كلمة_المرور_هنا",
-    "sslmode": "require",
-}
-
-# الخيار الثاني (أفضل أمانًا): استخدم ملف .streamlit/secrets.toml بهذا الشكل:
-# [postgres]
-# host = "ep-steep-bonus-ax7dker6.c-4.us-east-2.aws.neon.tech"
-# dbname = "point"
-# user = "neondb_owner"
-# password = "..."
-# sslmode = "require"
-#
-# وبعدين استبدل DB_CONFIG أعلاه بـ:
-# DB_CONFIG = st.secrets["postgres"]
-
 TABLE_NAME = "point"
 GEOM_COLUMN = "shape"      # اسم عمود الجيومتري الحقيقي عندك
 PK_COLUMN = "gis_oid"      # عمود المفتاح الأساسي (Primary Key)
@@ -56,53 +47,65 @@ FORM_COLUMNS = [
 ]
 
 
-# =========================================================
-# 2) دوال الاتصال والاستعلامات
-# =========================================================
 @st.cache_resource
-def get_connection():
-    return psycopg2.connect(**DB_CONFIG)
+def get_engine():
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("لم يتم العثور على DATABASE_URL في ملف .env")
+    # تحويل postgresql:// إلى postgresql+psycopg:// عشان يستخدم psycopg v3 async
+    db_url = re.sub(r"^postgresql:", "postgresql+psycopg:", db_url)
+    return create_async_engine(db_url, echo=False)
 
 
-def run_query(sql, params=None, fetch=False):
-    conn = get_connection()
-    with conn.cursor() as cur:
-        cur.execute(sql, params)
-        if fetch:
-            cols = [desc[0] for desc in cur.description]
-            rows = cur.fetchall()
-            conn.commit()
-            return pd.DataFrame(rows, columns=cols)
-        conn.commit()
+def run_async(coro):
+    """يشغّل coroutine من كود Streamlit المتزامن (Sync)."""
+    return asyncio.run(coro)
+
+
+# =========================================================
+# 2) دوال قاعدة البيانات (كلها async)
+# =========================================================
+async def _fetch_df(sql, params=None):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        result = await conn.execute(text(sql), params or {})
+        rows = result.fetchall()
+        cols = result.keys()
+        return pd.DataFrame(rows, columns=cols)
+
+
+async def _execute(sql, params=None):
+    engine = get_engine()
+    async with engine.connect() as conn:
+        await conn.execute(text(sql), params or {})
+        await conn.commit()
 
 
 def load_data():
     cols = ", ".join([PK_COLUMN] + FORM_COLUMNS + ["lat", "long"])
-    sql = f'SELECT {cols} FROM {TABLE_NAME} ORDER BY {PK_COLUMN} DESC LIMIT 200;'
-    return run_query(sql, fetch=True)
+    sql = f"SELECT {cols} FROM {TABLE_NAME} ORDER BY {PK_COLUMN} DESC LIMIT 200"
+    return run_async(_fetch_df(sql))
 
 
 def insert_point(lat, lng, values: dict):
-    cols = ["shape"] + list(values.keys())
-    placeholders = ["ST_SetSRID(ST_MakePoint(%s, %s), %s)"] + ["%s"] * len(values)
-    sql = f'''
-        INSERT INTO {TABLE_NAME} ({", ".join(cols)})
-        VALUES ({", ".join(placeholders)})
-    '''
-    params = [lng, lat, SRID] + list(values.values())
-    run_query(sql, params)
+    cols = [GEOM_COLUMN] + list(values.keys())
+    col_list = ", ".join(f'"{c}"' for c in cols)
+    val_list = ["ST_SetSRID(ST_MakePoint(:lng, :lat), :srid)"] + [f":{k}" for k in values.keys()]
+    sql = f'INSERT INTO {TABLE_NAME} ({col_list}) VALUES ({", ".join(val_list)})'
+    params = {"lng": lng, "lat": lat, "srid": SRID, **values}
+    run_async(_execute(sql, params))
 
 
 def update_point(pk_value, values: dict):
-    set_clause = ", ".join([f'"{k}" = %s' for k in values.keys()])
-    sql = f'UPDATE {TABLE_NAME} SET {set_clause} WHERE {PK_COLUMN} = %s'
-    params = list(values.values()) + [pk_value]
-    run_query(sql, params)
+    set_clause = ", ".join(f'"{k}" = :{k}' for k in values.keys())
+    sql = f'UPDATE {TABLE_NAME} SET {set_clause} WHERE {PK_COLUMN} = :pk_value'
+    params = {**values, "pk_value": pk_value}
+    run_async(_execute(sql, params))
 
 
 def delete_point(pk_value):
-    sql = f'DELETE FROM {TABLE_NAME} WHERE {PK_COLUMN} = %s'
-    run_query(sql, [pk_value])
+    sql = f"DELETE FROM {TABLE_NAME} WHERE {PK_COLUMN} = :pk_value"
+    run_async(_execute(sql, {"pk_value": pk_value}))
 
 
 # =========================================================
@@ -141,11 +144,9 @@ with tab_add:
         submitted = st.form_submit_button("إضافة النقطة")
         if submitted:
             try:
-                # إزالة الحقول الفاضية لو تبي (اختياري)
                 clean_values = {k: v for k, v in form_values.items() if v}
                 insert_point(lat, lng, clean_values)
                 st.success("✅ تمت إضافة النقطة بنجاح")
-                st.cache_resource.clear()
             except Exception as e:
                 st.error(f"❌ فشل الإضافة: {e}")
 
@@ -171,7 +172,6 @@ with tab_edit:
                     try:
                         update_point(selected_id, edit_values)
                         st.success("✅ تم التعديل بنجاح")
-                        st.cache_resource.clear()
                     except Exception as e:
                         st.error(f"❌ فشل التعديل: {e}")
         else:
@@ -193,7 +193,6 @@ with tab_delete:
                 try:
                     delete_point(delete_id)
                     st.success("✅ تم الحذف بنجاح")
-                    st.cache_resource.clear()
                 except Exception as e:
                     st.error(f"❌ فشل الحذف: {e}")
         else:
