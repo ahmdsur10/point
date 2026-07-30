@@ -12,17 +12,13 @@
     3) streamlit run point_manager_app.py
 """
 
-import os
 import re
 import asyncio
 
 import streamlit as st
 import pandas as pd
-from dotenv import load_dotenv
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
-
-load_dotenv()
 
 # =========================================================
 # 1) إعداد الاتصال (Async Engine مرة وحدة فقط، مخزن بالـ cache)
@@ -49,9 +45,9 @@ FORM_COLUMNS = [
 
 @st.cache_resource
 def get_engine():
-    db_url = os.getenv("DATABASE_URL")
+    db_url = st.secrets.get("DATABASE_URL")
     if not db_url:
-        raise RuntimeError("لم يتم العثور على DATABASE_URL في ملف .env")
+        raise RuntimeError("لم يتم العثور على DATABASE_URL في secrets.toml")
     # تحويل postgresql:// إلى postgresql+psycopg:// عشان يستخدم psycopg v3 async
     db_url = re.sub(r"^postgresql:", "postgresql+psycopg:", db_url)
     return create_async_engine(db_url, echo=False)
