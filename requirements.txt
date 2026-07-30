@@ -1,3 +1,5 @@
 streamlit
-psycopg2-binary
 pandas
+sqlalchemy>=2.0
+psycopg[binary]
+python-dotenv
