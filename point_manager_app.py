@@ -184,13 +184,12 @@ with tab_map:
             icon=folium.Icon(color="red", icon="plus", prefix="fa"),
         ).add_to(m)
 
-    map_output = st_folium(
-        m,
-        height=500,
-        use_container_width=True,
-        key="main_map",
-        returned_objects=["last_clicked"],  # نقلل الحساسية: نتابع بس الضغطة، مو كل حركة ماوس
-    )
+    try:
+        map_output = st_folium(m, height=500, use_container_width=True, key="main_map")
+    except Exception as e:
+        map_output = None
+        st.error(f"خطأ في عرض الخريطة: {e}")
+        st.info("جرب تحدّث المكتبة: pip install --upgrade streamlit-folium folium")
 
     # التقاط ضغطة المستخدم على الخريطة
     if map_output and map_output.get("last_clicked"):
