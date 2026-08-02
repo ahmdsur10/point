@@ -91,8 +91,10 @@ def load_data():
     return run_async(_fetch_df(sql))
 
 
+@st.cache_data(ttl=30)
 def load_map_data():
-    """يجيب كل النقاط مع إحداثيات محولة لـ WGS84 (4326) عشان تُعرض على الخريطة بشكل صحيح."""
+    """يجيب كل النقاط مع إحداثيات محولة لـ WGS84 (4326) عشان تُعرض على الخريطة بشكل صحيح.
+    نخزنها مؤقتًا (30 ثانية) لتجنب إعادة الاستعلام من القاعدة مع كل تفاعل بسيط على الخريطة."""
     cols = ", ".join([PK_COLUMN] + FORM_COLUMNS)
     sql = f"""
         SELECT {cols},
@@ -177,7 +179,13 @@ with tab_map:
             icon=folium.Icon(color="red", icon="plus", prefix="fa"),
         ).add_to(m)
 
-    map_output = st_folium(m, height=500, use_container_width=True, key="main_map")
+    map_output = st_folium(
+        m,
+        height=500,
+        use_container_width=True,
+        key="main_map",
+        returned_objects=["last_clicked"],  # نقلل الحساسية: نتابع بس الضغطة، مو كل حركة ماوس
+    )
 
     # التقاط ضغطة المستخدم على الخريطة
     if map_output and map_output.get("last_clicked"):
@@ -207,6 +215,7 @@ with tab_map:
                     insert_point(loc["lat"], loc["lng"], clean_values)
                     st.success("✅ تمت إضافة النقطة بنجاح")
                     del st.session_state["new_point_location"]
+                    load_map_data.clear()
                     st.rerun()
                 except Exception as e:
                     st.error(f"❌ فشل الإضافة: {e}")
