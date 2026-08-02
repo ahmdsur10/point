@@ -58,7 +58,12 @@ def get_engine():
         raise RuntimeError("لم يتم العثور على DATABASE_URL في secrets.toml")
     # تحويل postgresql:// إلى postgresql+psycopg:// عشان يستخدم psycopg v3 async
     db_url = re.sub(r"^postgresql:", "postgresql+psycopg:", db_url)
-    return create_async_engine(db_url, echo=False)
+    return create_async_engine(
+        db_url,
+        echo=False,
+        pool_pre_ping=True,   # يتأكد الاتصال شغال قبل كل استعلام، ويفتح اتصال جديد تلقائيًا لو انقطع
+        pool_recycle=180,     # يجدد الاتصال كل 3 دقايق عشان ما ينقطع بسبب خمول Neon (Scale to Zero)
+    )
 
 
 def run_async(coro):
