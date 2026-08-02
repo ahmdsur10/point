@@ -2,3 +2,5 @@ streamlit
 pandas
 sqlalchemy>=2.0
 psycopg[binary]
+folium
+streamlit-folium
