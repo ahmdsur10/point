@@ -1,14 +1,19 @@
 """
-تطبيق إدارة نقاط - Point Manager (نسخة SQLAlchemy Async)
+تطبيق إدارة نقاط - Point Manager (نسخة SQLAlchemy Async + خريطة تفاعلية)
 يتصل بجدول 'point' في قاعدة بيانات PostGIS على Neon باستخدام:
     - SQLAlchemy Async Engine
     - psycopg (v3) كـ driver
-    - DATABASE_URL من ملف .env
+    - st.secrets لبيانات الاتصال (.streamlit/secrets.toml)
+
+المزايا:
+    - خريطة تفاعلية تعرض كل النقاط
+    - إضافة نقطة جديدة بالضغط على الخريطة مباشرة
+    - إضافة / تعديل / حذف عبر نماذج تقليدية أيضًا
 
 طريقة التشغيل:
     1) pip install -r requirements.txt
-    2) أنشئ ملف .env بجانب هذا الملف وحط فيه:
-           DATABASE_URL=postgresql://neondb_owner:PASSWORD@ep-steep-bonus-ax7dker6.c-4.us-east-2.aws.neon.tech/point?sslmode=require
+    2) أنشئ .streamlit/secrets.toml بجانب هذا الملف وحط فيه:
+           DATABASE_URL = "postgresql://neondb_owner:PASSWORD@ep-steep-bonus-ax7dker6.c-4.us-east-2.aws.neon.tech/point?sslmode=require"
     3) streamlit run point_manager_app.py
 """
 
@@ -17,6 +22,8 @@ import asyncio
 
 import streamlit as st
 import pandas as pd
+import folium
+from streamlit_folium import st_folium
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -84,6 +91,20 @@ def load_data():
     return run_async(_fetch_df(sql))
 
 
+def load_map_data():
+    """يجيب كل النقاط مع إحداثيات محولة لـ WGS84 (4326) عشان تُعرض على الخريطة بشكل صحيح."""
+    cols = ", ".join([PK_COLUMN] + FORM_COLUMNS)
+    sql = f"""
+        SELECT {cols},
+               ST_Y(ST_Transform({GEOM_COLUMN}, {INPUT_SRID})) AS map_lat,
+               ST_X(ST_Transform({GEOM_COLUMN}, {INPUT_SRID})) AS map_lng
+        FROM {TABLE_NAME}
+        WHERE {GEOM_COLUMN} IS NOT NULL
+        LIMIT 1000
+    """
+    return run_async(_fetch_df(sql))
+
+
 def insert_point(lat, lng, values: dict):
     cols = [GEOM_COLUMN] + list(values.keys())
     col_list = ", ".join(f'"{c}"' for c in cols)
@@ -111,9 +132,88 @@ def delete_point(pk_value):
 st.set_page_config(page_title="إدارة نقاط الخريطة", layout="wide")
 st.title("🗺️ إدارة نقاط الخريطة - Point Manager")
 
-tab_view, tab_add, tab_edit, tab_delete = st.tabs(
-    ["📋 عرض البيانات", "➕ إضافة نقطة", "✏️ تعديل نقطة", "🗑️ حذف نقطة"]
+tab_map, tab_view, tab_add, tab_edit, tab_delete = st.tabs(
+    ["🗺️ الخريطة", "📋 عرض البيانات", "➕ إضافة نقطة", "✏️ تعديل نقطة", "🗑️ حذف نقطة"]
 )
+
+# ---------------- تبويب الخريطة ----------------
+with tab_map:
+    st.subheader("كل النقاط على الخريطة")
+    st.caption("اضغط على أي مكان بالخريطة لتحديد موقع نقطة جديدة، ثم عبّي البيانات تحت واحفظ.")
+
+    try:
+        map_df = load_map_data()
+    except Exception as e:
+        map_df = pd.DataFrame()
+        st.error(f"خطأ في جلب بيانات الخريطة: {e}")
+
+    # مركز الخريطة: لو فيه بيانات نتوسط عليها، ولو لا نستخدم الرياض كافتراضي
+    if not map_df.empty:
+        center_lat = map_df["map_lat"].mean()
+        center_lng = map_df["map_lng"].mean()
+    else:
+        center_lat, center_lng = 24.7136, 46.6753
+
+    m = folium.Map(location=[center_lat, center_lng], zoom_start=11)
+
+    # عرض كل النقاط الموجودة كـ markers
+    for _, row in map_df.iterrows():
+        popup_lines = [f"<b>{col}:</b> {row[col]}" for col in FORM_COLUMNS if pd.notna(row[col]) and row[col] != ""]
+        popup_html = "<br>".join(popup_lines) if popup_lines else f"{PK_COLUMN}: {row[PK_COLUMN]}"
+        folium.Marker(
+            location=[row["map_lat"], row["map_lng"]],
+            popup=folium.Popup(popup_html, max_width=300),
+            tooltip=str(row[PK_COLUMN]),
+            icon=folium.Icon(color="blue", icon="map-marker", prefix="fa"),
+        ).add_to(m)
+
+    # لو فيه موقع جديد محدد (مو محفوظ بعد)، نعرضه بلون مختلف
+    if st.session_state.get("new_point_location"):
+        new_lat = st.session_state["new_point_location"]["lat"]
+        new_lng = st.session_state["new_point_location"]["lng"]
+        folium.Marker(
+            location=[new_lat, new_lng],
+            tooltip="نقطة جديدة (لم تُحفظ بعد)",
+            icon=folium.Icon(color="red", icon="plus", prefix="fa"),
+        ).add_to(m)
+
+    map_output = st_folium(m, height=500, use_container_width=True, key="main_map")
+
+    # التقاط ضغطة المستخدم على الخريطة
+    if map_output and map_output.get("last_clicked"):
+        clicked_lat = map_output["last_clicked"]["lat"]
+        clicked_lng = map_output["last_clicked"]["lng"]
+        st.session_state["new_point_location"] = {"lat": clicked_lat, "lng": clicked_lng}
+
+    # لو فيه موقع محدد، اعرض نموذج تعبئة البيانات تحت الخريطة
+    if st.session_state.get("new_point_location"):
+        loc = st.session_state["new_point_location"]
+        st.info(f"📍 الموقع المحدد: Lat = {loc['lat']:.6f}, Lng = {loc['lng']:.6f}")
+
+        with st.form("map_add_form"):
+            map_form_values = {}
+            for col in FORM_COLUMNS:
+                map_form_values[col] = st.text_input(col, key=f"map_add_{col}")
+
+            col_save, col_cancel = st.columns(2)
+            with col_save:
+                map_submitted = st.form_submit_button("💾 حفظ النقطة", type="primary")
+            with col_cancel:
+                map_cancelled = st.form_submit_button("❌ إلغاء التحديد")
+
+            if map_submitted:
+                try:
+                    clean_values = {k: v for k, v in map_form_values.items() if v}
+                    insert_point(loc["lat"], loc["lng"], clean_values)
+                    st.success("✅ تمت إضافة النقطة بنجاح")
+                    del st.session_state["new_point_location"]
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ فشل الإضافة: {e}")
+
+            if map_cancelled:
+                del st.session_state["new_point_location"]
+                st.rerun()
 
 # ---------------- تبويب العرض ----------------
 with tab_view:
