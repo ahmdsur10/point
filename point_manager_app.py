@@ -1,12 +1,12 @@
 """
-تطبيق إدارة نقاط - Point Manager (نسخة SQLAlchemy Async + خريطة تفاعلية)
+تطبيق إدارة نقاط - Point Manager (نسخة SQLAlchemy Sync + خريطة تفاعلية)
 يتصل بجدول 'point' في قاعدة بيانات PostGIS على Neon باستخدام:
-    - SQLAlchemy Async Engine
+    - SQLAlchemy Engine عادي (Sync، بدون asyncio)
     - psycopg (v3) كـ driver
     - st.secrets لبيانات الاتصال (.streamlit/secrets.toml)
 
 المزايا:
-    - خريطة تفاعلية تعرض كل النقاط
+    - خريطة تفاعلية تعرض كل النقاط (بتقنية MarkerCluster للأداء)
     - إضافة نقطة جديدة بالضغط على الخريطة مباشرة
     - إضافة / تعديل / حذف عبر نماذج تقليدية أيضًا
 
@@ -18,18 +18,16 @@
 """
 
 import re
-import asyncio
 
 import streamlit as st
 import pandas as pd
 import folium
 from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy import text, create_engine
 
 # =========================================================
-# 1) إعداد الاتصال (Async Engine مرة وحدة فقط، مخزن بالـ cache)
+# 1) إعداد الاتصال (Engine عادي متزامن، محفوظ بالـ cache مرة وحدة)
 # =========================================================
 TABLE_NAME = "point"
 GEOM_COLUMN = "shape"      # اسم عمود الجيومتري الحقيقي عندك
@@ -57,9 +55,9 @@ def get_engine():
     db_url = st.secrets.get("DATABASE_URL")
     if not db_url:
         raise RuntimeError("لم يتم العثور على DATABASE_URL في secrets.toml")
-    # تحويل postgresql:// إلى postgresql+psycopg:// عشان يستخدم psycopg v3 async
+    # تحويل postgresql:// إلى postgresql+psycopg:// عشان يستخدم psycopg v3 (sync)
     db_url = re.sub(r"^postgresql:", "postgresql+psycopg:", db_url)
-    return create_async_engine(
+    return create_engine(
         db_url,
         echo=False,
         pool_pre_ping=True,   # يتأكد الاتصال شغال قبل كل استعلام، ويفتح اتصال جديد تلقائيًا لو انقطع
@@ -67,34 +65,29 @@ def get_engine():
     )
 
 
-def run_async(coro):
-    """يشغّل coroutine من كود Streamlit المتزامن (Sync)."""
-    return asyncio.run(coro)
-
-
 # =========================================================
-# 2) دوال قاعدة البيانات (كلها async)
+# 2) دوال قاعدة البيانات (كلها sync عادية، بدون asyncio)
 # =========================================================
-async def _fetch_df(sql, params=None):
+def _fetch_df(sql, params=None):
     engine = get_engine()
-    async with engine.connect() as conn:
-        result = await conn.execute(text(sql), params or {})
+    with engine.connect() as conn:
+        result = conn.execute(text(sql), params or {})
         rows = result.fetchall()
         cols = result.keys()
         return pd.DataFrame(rows, columns=cols)
 
 
-async def _execute(sql, params=None):
+def _execute(sql, params=None):
     engine = get_engine()
-    async with engine.connect() as conn:
-        await conn.execute(text(sql), params or {})
-        await conn.commit()
+    with engine.connect() as conn:
+        conn.execute(text(sql), params or {})
+        conn.commit()
 
 
 def load_data():
     cols = ", ".join([PK_COLUMN] + FORM_COLUMNS + ["lat", "long"])
     sql = f"SELECT {cols} FROM {TABLE_NAME} ORDER BY {PK_COLUMN} DESC LIMIT 200"
-    return run_async(_fetch_df(sql))
+    return _fetch_df(sql)
 
 
 @st.cache_data(ttl=30)
@@ -110,7 +103,7 @@ def load_map_data():
         WHERE {GEOM_COLUMN} IS NOT NULL
         LIMIT 1000
     """
-    return run_async(_fetch_df(sql))
+    return _fetch_df(sql)
 
 
 def insert_point(lat, lng, values: dict):
@@ -119,25 +112,37 @@ def insert_point(lat, lng, values: dict):
     val_list = ["ST_Transform(ST_SetSRID(ST_MakePoint(:lng, :lat), :input_srid), :table_srid)"] + [f":{k}" for k in values.keys()]
     sql = f'INSERT INTO {TABLE_NAME} ({col_list}) VALUES ({", ".join(val_list)})'
     params = {"lng": lng, "lat": lat, "input_srid": INPUT_SRID, "table_srid": TABLE_SRID, **values}
-    run_async(_execute(sql, params))
+    _execute(sql, params)
 
 
 def update_point(pk_value, values: dict):
     set_clause = ", ".join(f'"{k}" = :{k}' for k in values.keys())
     sql = f'UPDATE {TABLE_NAME} SET {set_clause} WHERE {PK_COLUMN} = :pk_value'
     params = {**values, "pk_value": pk_value}
-    run_async(_execute(sql, params))
+    _execute(sql, params)
 
 
 def delete_point(pk_value):
     sql = f"DELETE FROM {TABLE_NAME} WHERE {PK_COLUMN} = :pk_value"
-    run_async(_execute(sql, {"pk_value": pk_value}))
+    _execute(sql, {"pk_value": pk_value})
 
 
 # =========================================================
 # 3) واجهة التطبيق
 # =========================================================
 st.set_page_config(page_title="إدارة نقاط الخريطة", layout="wide")
+
+# ---------------------------------------------------------
+# 🧪 اختبار تشخيصي مؤقت: خريطة مصغرة بسيطة بدون أي اتصال بقاعدة البيانات
+# احذف هذا القسم بعد ما تنتهي من التشخيص
+# ---------------------------------------------------------
+st.write("### 🧪 اختبار خريطة مصغر")
+test_map = folium.Map(location=[24.7136, 46.6753], zoom_start=10)
+st_folium(test_map, height=300, key="test_minimal_map")
+st.write("### ⬆️ لو ظهرت الخريطة فوق، المشكلة بالكود. لو لا، المشكلة بالنشر")
+st.divider()
+# ---------------------------------------------------------
+
 st.title("🗺️ إدارة نقاط الخريطة - Point Manager")
 
 # =========================================================
@@ -187,7 +192,8 @@ if st.session_state.get("new_point_location"):
     ).add_to(m)
 
 try:
-    map_output = st_folium(m, width=900, height=500, key="main_map")
+    map_output = st_folium(m, width="100%", height=500,
+                            returned_objects=["last_clicked"], key="main_map")
 except Exception as e:
     map_output = None
     st.error(f"خطأ في عرض الخريطة: {e}")
