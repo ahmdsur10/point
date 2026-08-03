@@ -187,7 +187,7 @@ if st.session_state.get("new_point_location"):
     ).add_to(m)
 
 try:
-    map_output = st_folium(m, height=500, use_container_width=True, key="main_map")
+    map_output = st_folium(m, width=900, height=500, key="main_map")
 except Exception as e:
     map_output = None
     st.error(f"خطأ في عرض الخريطة: {e}")
