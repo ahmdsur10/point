@@ -23,6 +23,7 @@ import asyncio
 import streamlit as st
 import pandas as pd
 import folium
+from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -148,16 +149,11 @@ st.title("🗺️ إدارة نقاط الخريطة - Point Manager")
 st.subheader("🗺️ كل النقاط على الخريطة")
 st.caption("اضغط على أي مكان بالخريطة لتحديد موقع نقطة جديدة، ثم عبّي البيانات تحت واحفظ.")
 
-st.write("✅ checkpoint 1: قبل جلب بيانات الخريطة")
-
 try:
     map_df = load_map_data()
-    st.write(f"✅ checkpoint 2: تم جلب البيانات، عدد الصفوف = {len(map_df)}")
 except Exception as e:
     map_df = pd.DataFrame()
     st.error(f"خطأ في جلب بيانات الخريطة: {e}")
-
-st.write("✅ checkpoint 3: قبل بناء الخريطة")
 
 # مركز الخريطة: لو فيه بيانات نتوسط عليها، ولو لا نستخدم الرياض كافتراضي
 if not map_df.empty:
@@ -166,13 +162,10 @@ if not map_df.empty:
 else:
     center_lat, center_lng = 24.7136, 46.6753
 
-st.write(f"✅ checkpoint 4: المركز = {center_lat}, {center_lng}")
-
 m = folium.Map(location=[center_lat, center_lng], zoom_start=11)
+marker_cluster = MarkerCluster().add_to(m)
 
-st.write("✅ checkpoint 5: تم إنشاء كائن الخريطة folium.Map بنجاح")
-
-# عرض كل النقاط الموجودة كـ markers
+# عرض كل النقاط الموجودة كـ markers داخل Cluster (أداء أفضل بكثير مع مئات النقاط)
 for _, row in map_df.iterrows():
     popup_lines = [f"<b>{col}:</b> {row[col]}" for col in FORM_COLUMNS if pd.notna(row[col]) and row[col] != ""]
     popup_html = "<br>".join(popup_lines) if popup_lines else f"{PK_COLUMN}: {row[PK_COLUMN]}"
@@ -181,7 +174,7 @@ for _, row in map_df.iterrows():
         popup=folium.Popup(popup_html, max_width=300),
         tooltip=str(row[PK_COLUMN]),
         icon=folium.Icon(color="blue", icon="map-marker", prefix="fa"),
-    ).add_to(m)
+    ).add_to(marker_cluster)
 
 # لو فيه موقع جديد محدد (مو محفوظ بعد)، نعرضه بلون مختلف
 if st.session_state.get("new_point_location"):
@@ -193,11 +186,8 @@ if st.session_state.get("new_point_location"):
         icon=folium.Icon(color="red", icon="plus", prefix="fa"),
     ).add_to(m)
 
-st.write(f"✅ checkpoint 6: تمت إضافة {len(map_df)} ماركر، جاري عرض المكوّن الآن...")
-
 try:
     map_output = st_folium(m, height=500, use_container_width=True, key="main_map")
-    st.write("✅ checkpoint 7: st_folium انتهى بدون exception")
 except Exception as e:
     map_output = None
     st.error(f"خطأ في عرض الخريطة: {e}")
