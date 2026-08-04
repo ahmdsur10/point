@@ -106,8 +106,8 @@ def load_map_data():
     return _fetch_df(sql)
 
 
-@st.cache_data(ttl=15)
-def load_points_in_bounds(south, west, north, east, limit=500):
+@st.cache_data(ttl=30)
+def load_points_in_bounds(south, west, north, east, limit=300):
     """يجيب بس النقاط الموجودة داخل حدود الخريطة الظاهرة حاليًا (Viewport).
     يستخدم ST_Intersects مع Spatial Index (GiST) على عمود shape، فيكون سريع جدًا
     حتى مع آلاف النقاط - لازم ينفذ هذا الأمر مرة وحدة بـ pgAdmin أول شي:
@@ -262,18 +262,24 @@ except Exception as e:
 
 st.caption(f"📍 عدد النقاط الظاهرة حاليًا: {len(map_df)}")
 
-m = folium.Map(location=[center_lat, center_lng], zoom_start=zoom_level)
-marker_cluster = MarkerCluster().add_to(m)
+m = folium.Map(location=[center_lat, center_lng], zoom_start=zoom_level, prefer_canvas=True)
+marker_cluster = MarkerCluster(disableClusteringAtZoom=17).add_to(m)
 
-# عرض النقاط داخل Cluster
+# عرض النقاط داخل Cluster - نستخدم CircleMarker (خفيف جدًا، بدون تحميل صور أيقونات)
+# بدل Marker+Icon(fa) اللي يحمّل ملفات FontAwesome لكل نقطة ويثقل الخريطة
 for _, row in map_df.iterrows():
     popup_lines = [f"<b>{col}:</b> {row[col]}" for col in FORM_COLUMNS if pd.notna(row[col]) and row[col] != ""]
     popup_html = "<br>".join(popup_lines) if popup_lines else f"{PK_COLUMN}: {row[PK_COLUMN]}"
-    folium.Marker(
+    folium.CircleMarker(
         location=[row["map_lat"], row["map_lng"]],
+        radius=7,
+        color="#1a73e8",
+        fill=True,
+        fill_color="#1a73e8",
+        fill_opacity=0.85,
+        weight=1,
         popup=folium.Popup(popup_html, max_width=300),
         tooltip=str(row[PK_COLUMN]),
-        icon=folium.Icon(color="blue", icon="map-marker", prefix="fa"),
     ).add_to(marker_cluster)
 
 # ماركر بارز لنتيجة البحث المختارة
@@ -306,16 +312,22 @@ except Exception as e:
     st.error(f"خطأ في عرض الخريطة: {e}")
     st.info("جرب تحدّث المكتبة: pip install --upgrade streamlit-folium folium")
 
-# حفظ حدود الخريطة الحالية (Bounds) عشان الاستعلام القادم يجيب بس النقاط بهذا النطاق
+# حفظ حدود الخريطة الحالية (Bounds) للاستخدام في الاستعلام - بدون rerun تلقائي
+# (rerun تلقائي مع كل حركة بسيطة كان يسبب ثقل ملحوظ). المستخدم يضغط "تحديث حسب العرض"
+# متى ما يحتاج يشوف نقاط منطقة جديدة بعد ما يحرّك/يكبّر الخريطة.
 if map_output and map_output.get("bounds"):
     b = map_output["bounds"]
-    new_bounds = {
+    st.session_state["pending_bounds"] = {
         "south": b["_southWest"]["lat"], "west": b["_southWest"]["lng"],
         "north": b["_northEast"]["lat"], "east": b["_northEast"]["lng"],
     }
-    if new_bounds != st.session_state.get("last_map_bounds"):
-        st.session_state["last_map_bounds"] = new_bounds
-        st.rerun()
+
+refresh_col1, refresh_col2 = st.columns([1, 4])
+with refresh_col1:
+    if st.button("🔄 تحديث حسب العرض الحالي", use_container_width=True):
+        if st.session_state.get("pending_bounds"):
+            st.session_state["last_map_bounds"] = st.session_state["pending_bounds"]
+            st.rerun()
 
 # التقاط ضغطة المستخدم على الخريطة لإضافة نقطة جديدة
 if map_output and map_output.get("last_clicked"):
