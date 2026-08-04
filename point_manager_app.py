@@ -266,12 +266,19 @@ if not search_results.empty:
     }
 
 # ---------------------------------------------------------
-# تحديد مركز/تكبير الخريطة (تركيز على نتيجة بحث، أو آخر موقع محفوظ، أو افتراضي)
+# تحديد مركز/تكبير الخريطة:
+# 1) لو فيه نتيجة بحث محددة: نتوسط عليها بزوم قريب
+# 2) لو المستخدم سوى "تحديث حسب العرض الحالي": نحافظ على نفس مركز وتكبير الخريطة كما هو
+# 3) غير كذا: نستخدم قيمة افتراضية (الرياض)
 # ---------------------------------------------------------
 if st.session_state.get("focus_location"):
     center_lat = st.session_state["focus_location"]["lat"]
     center_lng = st.session_state["focus_location"]["lng"]
     zoom_level = 17
+elif st.session_state.get("last_map_center") and st.session_state.get("last_map_zoom") is not None:
+    center_lat = st.session_state["last_map_center"]["lat"]
+    center_lng = st.session_state["last_map_center"]["lng"]
+    zoom_level = st.session_state["last_map_zoom"]
 else:
     center_lat, center_lng = 24.7136, 46.6753
     zoom_level = 12
@@ -349,7 +356,7 @@ if st.session_state.get("new_point_location"):
 try:
     map_output = st_folium(
         m, width="100%", height=550,
-        returned_objects=["last_clicked", "bounds"],
+        returned_objects=["last_clicked", "bounds", "zoom", "center"],
         key="main_map",
     )
 except Exception as e:
@@ -357,22 +364,33 @@ except Exception as e:
     st.error(f"خطأ في عرض الخريطة: {e}")
     st.info("جرب تحدّث المكتبة: pip install --upgrade streamlit-folium folium")
 
-# حفظ حدود الخريطة الحالية (Bounds) للاستخدام في الاستعلام - بدون rerun تلقائي
+# حفظ حدود/مركز/تكبير الخريطة الحالية للاستخدام لاحقًا - بدون rerun تلقائي
 # (rerun تلقائي مع كل حركة بسيطة كان يسبب ثقل ملحوظ). المستخدم يضغط "تحديث حسب العرض"
-# متى ما يحتاج يشوف نقاط منطقة جديدة بعد ما يحرّك/يكبّر الخريطة.
-if map_output and map_output.get("bounds"):
-    b = map_output["bounds"]
-    st.session_state["pending_bounds"] = {
-        "south": b["_southWest"]["lat"], "west": b["_southWest"]["lng"],
-        "north": b["_northEast"]["lat"], "east": b["_northEast"]["lng"],
-    }
+# متى ما يحتاج يشوف نقاط منطقة جديدة بعد ما يحرّك/يكبّر الخريطة - ونحافظ على نفس مستوى التكبير.
+if map_output:
+    if map_output.get("bounds"):
+        b = map_output["bounds"]
+        st.session_state["pending_bounds"] = {
+            "south": b["_southWest"]["lat"], "west": b["_southWest"]["lng"],
+            "north": b["_northEast"]["lat"], "east": b["_northEast"]["lng"],
+        }
+    if map_output.get("zoom") is not None:
+        st.session_state["pending_zoom"] = map_output["zoom"]
+    if map_output.get("center"):
+        st.session_state["pending_center"] = map_output["center"]
 
 refresh_col1, refresh_col2 = st.columns([1, 4])
 with refresh_col1:
     if st.button("🔄 تحديث حسب العرض الحالي", use_container_width=True):
         if st.session_state.get("pending_bounds"):
             st.session_state["last_map_bounds"] = st.session_state["pending_bounds"]
-            st.rerun()
+        if st.session_state.get("pending_zoom") is not None:
+            st.session_state["last_map_zoom"] = st.session_state["pending_zoom"]
+        if st.session_state.get("pending_center"):
+            st.session_state["last_map_center"] = st.session_state["pending_center"]
+        # الضغط على تحديث يعني المستخدم يبي يفضل بنفس منطقة/تكبير الخريطة، مو نتيجة بحث قديمة
+        st.session_state.pop("focus_location", None)
+        st.rerun()
 
 # التقاط ضغطة المستخدم على الخريطة لإضافة نقطة جديدة
 if map_output and map_output.get("last_clicked"):
@@ -419,8 +437,8 @@ st.divider()
 # =========================================================
 # باقي الوظائف تحت بالتبويبات (عرض / إضافة يدوي / تعديل / حذف)
 # =========================================================
-tab_view, tab_add, tab_edit, tab_delete = st.tabs(
-    ["📋 عرض البيانات", "➕ إضافة نقطة (يدوي)", "✏️ تعديل نقطة", "🗑️ حذف نقطة"]
+tab_view, tab_sql, tab_add, tab_edit, tab_delete = st.tabs(
+    ["📋 عرض البيانات", "🧮 استعلام SQL", "➕ إضافة نقطة (يدوي)", "✏️ تعديل نقطة", "🗑️ حذف نقطة"]
 )
 
 # ---------------- تبويب العرض ----------------
@@ -431,6 +449,35 @@ with tab_view:
         st.dataframe(df, use_container_width=True)
     except Exception as e:
         st.error(f"خطأ في جلب البيانات: {e}")
+
+# ---------------- تبويب استعلام SQL ----------------
+with tab_sql:
+    st.subheader("استعلام SQL مخصص")
+    st.caption("اكتب أي استعلام SELECT وشوف النتيجة كجدول. لأسباب أمان، مسموح بس بأوامر SELECT من هنا.")
+
+    default_sql = f"SELECT * FROM {TABLE_NAME} ORDER BY {PK_COLUMN} DESC LIMIT 100"
+    sql_query = st.text_area("الاستعلام:", value=default_sql, height=150, key="custom_sql")
+
+    run_sql = st.button("▶️ تنفيذ الاستعلام", type="primary")
+
+    if run_sql:
+        cleaned = sql_query.strip().strip(";")
+        if not cleaned.lower().startswith("select"):
+            st.error("❌ مسموح بس بأوامر SELECT من هذا التبويب (حماية من التعديل غير المقصود بالبيانات).")
+        else:
+            try:
+                result_df = _fetch_df(cleaned)
+                st.success(f"✅ تم تنفيذ الاستعلام - {len(result_df)} صف")
+                st.dataframe(result_df, use_container_width=True)
+
+                # زر تحميل النتيجة كملف CSV
+                csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "⬇️ تحميل النتيجة CSV", data=csv_bytes,
+                    file_name="query_result.csv", mime="text/csv",
+                )
+            except Exception as e:
+                st.error(f"❌ خطأ بتنفيذ الاستعلام: {e}")
 
 # ---------------- تبويب الإضافة ----------------
 with tab_add:
@@ -466,11 +513,18 @@ with tab_edit:
             )
             row = df_edit[df_edit[PK_COLUMN] == selected_id].iloc[0]
 
-            with st.form("edit_form"):
+            st.info(f"📝 البيانات الحالية للنقطة رقم {selected_id} - عدّل الحقل اللي تبيه بس واترك الباقي كما هو")
+
+            # مهم: نربط مفتاح كل حقل برقم النقطة نفسها (selected_id)، مو بس باسم العمود.
+            # لو المفتاح ثابت بين كل النقاط، Streamlit يحتفظ بالقيمة القديمة اللي كتبتها
+            # لنقطة سابقة وما يحدّثها للنقطة الجديدة المختارة.
+            with st.form(f"edit_form_{selected_id}"):
                 edit_values = {}
                 for col in FORM_COLUMNS:
                     current_val = row[col] if pd.notna(row[col]) else ""
-                    edit_values[col] = st.text_input(col, value=str(current_val), key=f"edit_{col}")
+                    edit_values[col] = st.text_input(
+                        col, value=str(current_val), key=f"edit_{selected_id}_{col}"
+                    )
 
                 update_submitted = st.form_submit_button("حفظ التعديلات")
                 if update_submitted:
