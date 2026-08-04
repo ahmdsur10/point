@@ -6,7 +6,7 @@
     - st.secrets لبيانات الاتصال (.streamlit/secrets.toml)
 
 المزايا:
-    - خريطة تفاعلية تعرض كل النقاط (بتقنية MarkerCluster للأداء)
+    - خريطة تفاعلية تعرض كل النقاط (بتقنية FastMarkerCluster للأداء العالي)
     - إضافة نقطة جديدة بالضغط على الخريطة مباشرة
     - إضافة / تعديل / حذف عبر نماذج تقليدية أيضًا
 
@@ -22,7 +22,7 @@ import re
 import streamlit as st
 import pandas as pd
 import folium
-from folium.plugins import MarkerCluster
+from folium.plugins import FastMarkerCluster
 from streamlit_folium import st_folium
 from sqlalchemy import text, create_engine
 
@@ -263,24 +263,37 @@ except Exception as e:
 st.caption(f"📍 عدد النقاط الظاهرة حاليًا: {len(map_df)}")
 
 m = folium.Map(location=[center_lat, center_lng], zoom_start=zoom_level, prefer_canvas=True)
-marker_cluster = MarkerCluster(disableClusteringAtZoom=17).add_to(m)
 
-# عرض النقاط داخل Cluster - نستخدم CircleMarker (خفيف جدًا، بدون تحميل صور أيقونات)
-# بدل Marker+Icon(fa) اللي يحمّل ملفات FontAwesome لكل نقطة ويثقل الخريطة
-for _, row in map_df.iterrows():
-    popup_lines = [f"<b>{col}:</b> {row[col]}" for col in FORM_COLUMNS if pd.notna(row[col]) and row[col] != ""]
-    popup_html = "<br>".join(popup_lines) if popup_lines else f"{PK_COLUMN}: {row[PK_COLUMN]}"
-    folium.CircleMarker(
-        location=[row["map_lat"], row["map_lng"]],
-        radius=7,
-        color="#1a73e8",
-        fill=True,
-        fill_color="#1a73e8",
-        fill_opacity=0.85,
-        weight=1,
-        popup=folium.Popup(popup_html, max_width=300),
-        tooltip=str(row[PK_COLUMN]),
-    ).add_to(marker_cluster)
+# نستخدم FastMarkerCluster بدل MarkerCluster العادي: يبني الماركرات عن طريق
+# كود JS مضغوط جدًا بدل ما ينشئ عنصر HTML/DOM كامل لكل نقطة بشكل منفصل.
+# هذا أسرع بشكل ملحوظ مع مئات/آلاف النقاط.
+if not map_df.empty:
+    # نبني للـ popup أهم عمودين/ثلاثة بس (بدل كل الأعمدة) عشان يفضل حجم البيانات المرسلة صغير وسريع
+    popup_cols = FORM_COLUMNS[:3]
+
+    def build_row(row):
+        parts = [f"<b>{c}:</b> {row[c]}" for c in popup_cols if pd.notna(row[c]) and row[c] != ""]
+        popup_text = "<br>".join(parts) if parts else f"{PK_COLUMN}: {row[PK_COLUMN]}"
+        return [row["map_lat"], row["map_lng"], popup_text]
+
+    cluster_data = [build_row(row) for _, row in map_df.iterrows()]
+
+    callback = """
+    function (row) {
+        var marker = L.circleMarker(new L.LatLng(row[0], row[1]), {
+            radius: 7, color: '#1a73e8', fillColor: '#1a73e8',
+            fillOpacity: 0.85, weight: 1
+        });
+        marker.bindPopup(row[2]);
+        return marker;
+    }
+    """
+
+    FastMarkerCluster(
+        data=cluster_data,
+        callback=callback,
+        disableClusteringAtZoom=17,
+    ).add_to(m)
 
 # ماركر بارز لنتيجة البحث المختارة
 if st.session_state.get("focus_location"):
