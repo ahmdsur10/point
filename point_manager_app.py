@@ -452,32 +452,153 @@ with tab_view:
 
 # ---------------- تبويب استعلام SQL ----------------
 with tab_sql:
-    st.subheader("استعلام SQL مخصص")
-    st.caption("اكتب أي استعلام SELECT وشوف النتيجة كجدول. لأسباب أمان، مسموح بس بأوامر SELECT من هنا.")
+    st.subheader("🧮 Select By Attributes")
 
-    default_sql = f"SELECT * FROM {TABLE_NAME} ORDER BY {PK_COLUMN} DESC LIMIT 100"
-    sql_query = st.text_area("الاستعلام:", value=default_sql, height=150, key="custom_sql")
+    # ---- Input Table (ثابت) ----
+    st.text_input("Input Table", value=TABLE_NAME, disabled=True, key="sql_input_table")
 
-    run_sql = st.button("▶️ تنفيذ الاستعلام", type="primary")
+    # ---- Selection Type ----
+    st.selectbox(
+        "Selection Type",
+        ["New selection"],
+        disabled=True,
+        key="sql_selection_type",
+        help="حاليًا مدعوم بس 'New selection' (استعلام جديد في كل مرة)",
+    )
 
-    if run_sql:
-        cleaned = sql_query.strip().strip(";")
+    st.markdown("**Expression**")
+
+    sql_editor_mode = st.toggle("🔧 SQL Editor (كتابة يدوية)", value=False, key="sql_editor_toggle")
+
+    OPERATORS = {
+        "is equal to": "=",
+        "is not equal to": "!=",
+        "is greater than": ">",
+        "is greater than or equal to": ">=",
+        "is less than": "<",
+        "is less than or equal to": "<=",
+        "contains": "CONTAINS",
+        "starts with": "STARTS_WITH",
+        "is null": "IS NULL",
+        "is not null": "IS NOT NULL",
+    }
+    ALL_FIELDS = [PK_COLUMN] + FORM_COLUMNS
+
+    if not sql_editor_mode:
+        # =========================================================
+        # وضع البناء التفاعلي (Builder) - شبيه بـ ArcGIS Select By Attributes
+        # =========================================================
+        if "sql_clauses" not in st.session_state:
+            st.session_state["sql_clauses"] = [{"field": ALL_FIELDS[0], "operator": "is equal to", "value": "", "bool_op": "And"}]
+
+        clauses = st.session_state["sql_clauses"]
+
+        for i, clause in enumerate(clauses):
+            row = st.columns([1, 2.5, 2.5, 3, 0.6])
+            with row[0]:
+                if i == 0:
+                    st.markdown("<div style='padding-top:8px'><b>Where</b></div>", unsafe_allow_html=True)
+                else:
+                    clause["bool_op"] = st.selectbox(
+                        " ", ["And", "Or"], index=["And", "Or"].index(clause.get("bool_op", "And")),
+                        key=f"bool_{i}", label_visibility="collapsed",
+                    )
+            with row[1]:
+                clause["field"] = st.selectbox(
+                    " ", ALL_FIELDS, index=ALL_FIELDS.index(clause["field"]) if clause["field"] in ALL_FIELDS else 0,
+                    key=f"field_{i}", label_visibility="collapsed",
+                )
+            with row[2]:
+                op_names = list(OPERATORS.keys())
+                clause["operator"] = st.selectbox(
+                    " ", op_names, index=op_names.index(clause.get("operator", "is equal to")),
+                    key=f"op_{i}", label_visibility="collapsed",
+                )
+            with row[3]:
+                if OPERATORS[clause["operator"]] not in ("IS NULL", "IS NOT NULL"):
+                    clause["value"] = st.text_input(
+                        " ", value=clause.get("value", ""), key=f"val_{i}", label_visibility="collapsed",
+                    )
+                else:
+                    st.write("")
+            with row[4]:
+                st.write("")
+                if len(clauses) > 1 and st.button("✖", key=f"remove_{i}"):
+                    clauses.pop(i)
+                    st.rerun()
+
+        if st.button("➕ Add Clause"):
+            clauses.append({"field": ALL_FIELDS[0], "operator": "is equal to", "value": "", "bool_op": "And"})
+            st.rerun()
+
+        invert = st.checkbox("Invert Where Clause", key="sql_invert")
+
+        # ---- بناء SQL من الشروط ----
+        where_parts = []
+        params = {}
+        for i, clause in enumerate(clauses):
+            op_key = OPERATORS[clause["operator"]]
+            field = clause["field"]
+            prefix = "" if i == 0 else f' {clause.get("bool_op", "And").upper()} '
+            if op_key in ("IS NULL", "IS NOT NULL"):
+                part = f'"{field}" {op_key}'
+            elif op_key == "CONTAINS":
+                pname = f"val{i}"
+                part = f'"{field}"::text ILIKE :{pname}'
+                params[pname] = f"%{clause['value']}%"
+            elif op_key == "STARTS_WITH":
+                pname = f"val{i}"
+                part = f'"{field}"::text ILIKE :{pname}'
+                params[pname] = f"{clause['value']}%"
+            else:
+                pname = f"val{i}"
+                part = f'"{field}" {op_key} :{pname}'
+                params[pname] = clause["value"]
+            where_parts.append(prefix + part)
+
+        where_sql = "".join(where_parts) if where_parts else "1=1"
+        if invert:
+            where_sql = f"NOT ({where_sql})"
+
+        final_sql = f"SELECT * FROM {TABLE_NAME} WHERE {where_sql} LIMIT 500"
+        st.code(final_sql, language="sql")
+
+    else:
+        # =========================================================
+        # وضع الكتابة اليدوية (SQL Editor)
+        # =========================================================
+        default_sql = f"SELECT * FROM {TABLE_NAME} ORDER BY {PK_COLUMN} DESC LIMIT 100"
+        final_sql = st.text_area("SQL:", value=default_sql, height=150, key="custom_sql")
+        params = {}
+
+    st.divider()
+    col_apply, col_ok = st.columns(2)
+    with col_apply:
+        run_sql = st.button("▶️ Apply", type="primary", use_container_width=True)
+    with col_ok:
+        run_sql_ok = st.button("✅ OK (تنفيذ وإغلاق النتيجة السابقة)", use_container_width=True)
+
+    if run_sql or run_sql_ok:
+        cleaned = final_sql.strip().strip(";")
         if not cleaned.lower().startswith("select"):
             st.error("❌ مسموح بس بأوامر SELECT من هذا التبويب (حماية من التعديل غير المقصود بالبيانات).")
         else:
             try:
-                result_df = _fetch_df(cleaned)
-                st.success(f"✅ تم تنفيذ الاستعلام - {len(result_df)} صف")
-                st.dataframe(result_df, use_container_width=True)
-
-                # زر تحميل النتيجة كملف CSV
-                csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    "⬇️ تحميل النتيجة CSV", data=csv_bytes,
-                    file_name="query_result.csv", mime="text/csv",
-                )
+                result_df = _fetch_df(cleaned, params)
+                st.session_state["sql_last_result"] = result_df
+                st.success(f"✅ تم التنفيذ - {len(result_df)} صف")
             except Exception as e:
+                st.session_state.pop("sql_last_result", None)
                 st.error(f"❌ خطأ بتنفيذ الاستعلام: {e}")
+
+    if st.session_state.get("sql_last_result") is not None:
+        result_df = st.session_state["sql_last_result"]
+        st.dataframe(result_df, use_container_width=True)
+        csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "⬇️ Export Selection (CSV)", data=csv_bytes,
+            file_name="query_result.csv", mime="text/csv",
+        )
 
 # ---------------- تبويب الإضافة ----------------
 with tab_add:
