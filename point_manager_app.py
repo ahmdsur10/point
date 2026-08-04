@@ -92,8 +92,7 @@ def load_data():
 
 @st.cache_data(ttl=30)
 def load_map_data():
-    """يجيب كل النقاط مع إحداثيات محولة لـ WGS84 (4326) عشان تُعرض على الخريطة بشكل صحيح.
-    نخزنها مؤقتًا (30 ثانية) لتجنب إعادة الاستعلام من القاعدة مع كل تفاعل بسيط على الخريطة."""
+    """يجيب كل النقاط مع إحداثيات محولة لـ WGS84 (4326) - تستخدم كـ fallback أول مرة قبل تحديد حدود الخريطة."""
     cols = ", ".join([PK_COLUMN] + FORM_COLUMNS)
     sql = f"""
         SELECT {cols},
@@ -101,9 +100,59 @@ def load_map_data():
                ST_X(ST_Transform({GEOM_COLUMN}, {INPUT_SRID})) AS map_lng
         FROM {TABLE_NAME}
         WHERE {GEOM_COLUMN} IS NOT NULL
-        LIMIT 20
+        ORDER BY {PK_COLUMN} DESC
+        LIMIT 300
     """
     return _fetch_df(sql)
+
+
+@st.cache_data(ttl=15)
+def load_points_in_bounds(south, west, north, east, limit=500):
+    """يجيب بس النقاط الموجودة داخل حدود الخريطة الظاهرة حاليًا (Viewport).
+    يستخدم ST_Intersects مع Spatial Index (GiST) على عمود shape، فيكون سريع جدًا
+    حتى مع آلاف النقاط - لازم ينفذ هذا الأمر مرة وحدة بـ pgAdmin أول شي:
+        CREATE INDEX IF NOT EXISTS idx_point_shape ON point USING GIST (shape);
+    """
+    cols = ", ".join([PK_COLUMN] + FORM_COLUMNS)
+    sql = f"""
+        SELECT {cols},
+               ST_Y(ST_Transform({GEOM_COLUMN}, {INPUT_SRID})) AS map_lat,
+               ST_X(ST_Transform({GEOM_COLUMN}, {INPUT_SRID})) AS map_lng
+        FROM {TABLE_NAME}
+        WHERE {GEOM_COLUMN} IS NOT NULL
+          AND ST_Intersects(
+                {GEOM_COLUMN},
+                ST_Transform(
+                    ST_MakeEnvelope(:west, :south, :east, :north, :input_srid),
+                    :table_srid
+                )
+              )
+        LIMIT :limit
+    """
+    params = {
+        "west": west, "south": south, "east": east, "north": north,
+        "input_srid": INPUT_SRID, "table_srid": TABLE_SRID, "limit": limit,
+    }
+    return _fetch_df(sql, params)
+
+
+@st.cache_data(ttl=30)
+def search_points(query_text, limit=30):
+    """يدور على نص معين بأي عمود من أعمدة النموذج (بحث جزئي غير حساس لحالة الأحرف)."""
+    if not query_text or not query_text.strip():
+        return pd.DataFrame()
+    like_conditions = " OR ".join([f'"{col}"::text ILIKE :q' for col in FORM_COLUMNS])
+    cols = ", ".join([PK_COLUMN] + FORM_COLUMNS)
+    sql = f"""
+        SELECT {cols},
+               ST_Y(ST_Transform({GEOM_COLUMN}, {INPUT_SRID})) AS map_lat,
+               ST_X(ST_Transform({GEOM_COLUMN}, {INPUT_SRID})) AS map_lng
+        FROM {TABLE_NAME}
+        WHERE {GEOM_COLUMN} IS NOT NULL AND ({like_conditions})
+        LIMIT :limit
+    """
+    params = {"q": f"%{query_text.strip()}%", "limit": limit}
+    return _fetch_df(sql, params)
 
 
 def insert_point(lat, lng, values: dict):
@@ -139,26 +188,84 @@ st.title("🗺️ إدارة نقاط الخريطة - Point Manager")
 # حجمها صفر وتطلع بيضاء/فاضية حتى لو رجعت تفتح نفس التبويب.
 # لذلك نخليها دايمًا ظاهرة بأعلى الصفحة مباشرة.
 # =========================================================
-st.subheader("🗺️ كل النقاط على الخريطة")
-st.caption("اضغط على أي مكان بالخريطة لتحديد موقع نقطة جديدة، ثم عبّي البيانات تحت واحفظ.")
+st.subheader("🗺️ خريطة النقاط")
+st.caption("حرّك/كبّر الخريطة عشان تشوف النقاط بمنطقتك، ابحث عن نقطة محددة، أو اضغط على الخريطة لإضافة نقطة جديدة.")
 
+# ---------------------------------------------------------
+# مربع البحث
+# ---------------------------------------------------------
+search_col1, search_col2 = st.columns([4, 1])
+with search_col1:
+    search_query = st.text_input(
+        "🔍 ابحث عن نقطة (بالاسم، الرقم الموحد، الحي...)",
+        key="search_box",
+        placeholder="مثال: شارع الملك فهد",
+    )
+with search_col2:
+    st.write("")  # محاذاة
+    do_search = st.button("بحث", use_container_width=True)
+
+search_results = pd.DataFrame()
+if do_search and search_query:
+    try:
+        search_results = search_points(search_query)
+        if search_results.empty:
+            st.warning("ما فيه نتائج مطابقة")
+        else:
+            st.success(f"لقيت {len(search_results)} نتيجة")
+    except Exception as e:
+        st.error(f"خطأ بالبحث: {e}")
+
+# لو فيه نتيجة بحث، خلي المستخدم يختار وحدة يتوسط عليها الخريطة
+if not search_results.empty:
+    result_labels = {
+        idx: " - ".join(str(row[c]) for c in FORM_COLUMNS if pd.notna(row[c]) and row[c] != "") or f"نقطة {row[PK_COLUMN]}"
+        for idx, row in search_results.iterrows()
+    }
+    selected_idx = st.selectbox(
+        "اختر نتيجة للتوسط عليها بالخريطة:",
+        options=list(result_labels.keys()),
+        format_func=lambda i: result_labels[i],
+        key="search_result_select",
+    )
+    selected_row = search_results.loc[selected_idx]
+    st.session_state["focus_location"] = {
+        "lat": selected_row["map_lat"], "lng": selected_row["map_lng"]
+    }
+
+# ---------------------------------------------------------
+# تحديد مركز/تكبير الخريطة (تركيز على نتيجة بحث، أو آخر موقع محفوظ، أو افتراضي)
+# ---------------------------------------------------------
+if st.session_state.get("focus_location"):
+    center_lat = st.session_state["focus_location"]["lat"]
+    center_lng = st.session_state["focus_location"]["lng"]
+    zoom_level = 17
+else:
+    center_lat, center_lng = 24.7136, 46.6753
+    zoom_level = 12
+
+# ---------------------------------------------------------
+# جلب النقاط: حسب حدود الخريطة الحالية (Viewport) لو متوفرة، وإلا نستخدم مجموعة افتراضية
+# ---------------------------------------------------------
+last_bounds = st.session_state.get("last_map_bounds")
 try:
-    map_df = load_map_data()
+    if last_bounds:
+        map_df = load_points_in_bounds(
+            last_bounds["south"], last_bounds["west"],
+            last_bounds["north"], last_bounds["east"],
+        )
+    else:
+        map_df = load_map_data()
 except Exception as e:
     map_df = pd.DataFrame()
     st.error(f"خطأ في جلب بيانات الخريطة: {e}")
 
-# مركز الخريطة: لو فيه بيانات نتوسط عليها، ولو لا نستخدم الرياض كافتراضي
-if not map_df.empty:
-    center_lat = map_df["map_lat"].mean()
-    center_lng = map_df["map_lng"].mean()
-else:
-    center_lat, center_lng = 24.7136, 46.6753
+st.caption(f"📍 عدد النقاط الظاهرة حاليًا: {len(map_df)}")
 
-m = folium.Map(location=[center_lat, center_lng], zoom_start=11)
+m = folium.Map(location=[center_lat, center_lng], zoom_start=zoom_level)
 marker_cluster = MarkerCluster().add_to(m)
 
-# عرض كل النقاط الموجودة كـ markers داخل Cluster (أداء أفضل بكثير مع مئات النقاط)
+# عرض النقاط داخل Cluster
 for _, row in map_df.iterrows():
     popup_lines = [f"<b>{col}:</b> {row[col]}" for col in FORM_COLUMNS if pd.notna(row[col]) and row[col] != ""]
     popup_html = "<br>".join(popup_lines) if popup_lines else f"{PK_COLUMN}: {row[PK_COLUMN]}"
@@ -168,6 +275,15 @@ for _, row in map_df.iterrows():
         tooltip=str(row[PK_COLUMN]),
         icon=folium.Icon(color="blue", icon="map-marker", prefix="fa"),
     ).add_to(marker_cluster)
+
+# ماركر بارز لنتيجة البحث المختارة
+if st.session_state.get("focus_location"):
+    floc = st.session_state["focus_location"]
+    folium.Marker(
+        location=[floc["lat"], floc["lng"]],
+        tooltip="نتيجة البحث",
+        icon=folium.Icon(color="green", icon="star", prefix="fa"),
+    ).add_to(m)
 
 # لو فيه موقع جديد محدد (مو محفوظ بعد)، نعرضه بلون مختلف
 if st.session_state.get("new_point_location"):
@@ -180,18 +296,33 @@ if st.session_state.get("new_point_location"):
     ).add_to(m)
 
 try:
-    map_output = st_folium(m, width="100%", height=500,
-                            returned_objects=["last_clicked"], key="main_map")
+    map_output = st_folium(
+        m, width="100%", height=550,
+        returned_objects=["last_clicked", "bounds"],
+        key="main_map",
+    )
 except Exception as e:
     map_output = None
     st.error(f"خطأ في عرض الخريطة: {e}")
     st.info("جرب تحدّث المكتبة: pip install --upgrade streamlit-folium folium")
 
-# التقاط ضغطة المستخدم على الخريطة
+# حفظ حدود الخريطة الحالية (Bounds) عشان الاستعلام القادم يجيب بس النقاط بهذا النطاق
+if map_output and map_output.get("bounds"):
+    b = map_output["bounds"]
+    new_bounds = {
+        "south": b["_southWest"]["lat"], "west": b["_southWest"]["lng"],
+        "north": b["_northEast"]["lat"], "east": b["_northEast"]["lng"],
+    }
+    if new_bounds != st.session_state.get("last_map_bounds"):
+        st.session_state["last_map_bounds"] = new_bounds
+        st.rerun()
+
+# التقاط ضغطة المستخدم على الخريطة لإضافة نقطة جديدة
 if map_output and map_output.get("last_clicked"):
     clicked_lat = map_output["last_clicked"]["lat"]
     clicked_lng = map_output["last_clicked"]["lng"]
     st.session_state["new_point_location"] = {"lat": clicked_lat, "lng": clicked_lng}
+    st.session_state.pop("focus_location", None)
 
 # لو فيه موقع محدد، اعرض نموذج تعبئة البيانات تحت الخريطة
 if st.session_state.get("new_point_location"):
@@ -216,6 +347,8 @@ if st.session_state.get("new_point_location"):
                 st.success("✅ تمت إضافة النقطة بنجاح")
                 del st.session_state["new_point_location"]
                 load_map_data.clear()
+                load_points_in_bounds.clear()
+                search_points.clear()
                 st.rerun()
             except Exception as e:
                 st.error(f"❌ فشل الإضافة: {e}")
@@ -287,6 +420,9 @@ with tab_edit:
                     try:
                         update_point(selected_id, edit_values)
                         st.success("✅ تم التعديل بنجاح")
+                        load_map_data.clear()
+                        load_points_in_bounds.clear()
+                        search_points.clear()
                     except Exception as e:
                         st.error(f"❌ فشل التعديل: {e}")
         else:
@@ -308,6 +444,9 @@ with tab_delete:
                 try:
                     delete_point(delete_id)
                     st.success("✅ تم الحذف بنجاح")
+                    load_map_data.clear()
+                    load_points_in_bounds.clear()
+                    search_points.clear()
                 except Exception as e:
                     st.error(f"❌ فشل الحذف: {e}")
         else:
