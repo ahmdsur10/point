@@ -22,7 +22,7 @@ import re
 import streamlit as st
 import pandas as pd
 import folium
-from folium.plugins import FastMarkerCluster
+from folium.plugins import FastMarkerCluster, Draw
 from streamlit_folium import st_folium
 from sqlalchemy import text, create_engine
 
@@ -241,7 +241,7 @@ st.title("🗺️ إدارة نقاط الخريطة - Point Manager")
 # لذلك نخليها دايمًا ظاهرة بأعلى الصفحة مباشرة.
 # =========================================================
 st.subheader("🗺️ خريطة النقاط")
-st.caption("حرّك/كبّر الخريطة عشان تشوف النقاط بمنطقتك، ابحث عن نقطة محددة، أو اضغط على الخريطة لإضافة نقطة جديدة.")
+st.caption("حرّك/كبّر الخريطة عشان تشوف النقاط بمنطقتك، ابحث عن نقطة محددة، أو اضغط على أيقونة الماركر 📍 بأعلى يسار الخريطة ثم حدد مكان النقطة الجديدة. تقدر تبدّل بين خريطة الشوارع والصورة الجوية من أيقونة الطبقات بأعلى يمين الخريطة.")
 
 # ---------------------------------------------------------
 # مربع البحث
@@ -339,7 +339,20 @@ except Exception as e:
 
 st.caption(f"📍 عدد النقاط الظاهرة حاليًا: {len(map_df)}")
 
-m = folium.Map(location=[center_lat, center_lng], zoom_start=zoom_level, prefer_canvas=True)
+# نبني الخريطة بدون طبقة تايل افتراضية، ونضيف طبقتين يدويًا (شارع + قمر صناعي)
+# عشان يقدر المستخدم يبدل بينهم من أداة الطبقات (أيقونة أعلى يمين الخريطة)
+m = folium.Map(location=[center_lat, center_lng], zoom_start=zoom_level, prefer_canvas=True, tiles=None)
+
+folium.TileLayer(
+    tiles="OpenStreetMap", name="🗺️ خريطة الشوارع", overlay=False, control=True,
+).add_to(m)
+folium.TileLayer(
+    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    attr="Esri World Imagery",
+    name="🛰️ صورة جوية (قمر صناعي)",
+    overlay=False,
+    control=True,
+).add_to(m)
 
 # نستخدم FastMarkerCluster بدل MarkerCluster العادي: يبني الماركرات عن طريق
 # كود JS مضغوط جدًا بدل ما ينشئ عنصر HTML/DOM كامل لكل نقطة بشكل منفصل.
@@ -401,10 +414,29 @@ if st.session_state.get("new_point_location"):
         icon=folium.DivIcon(html=pulse_html, icon_size=(30, 30), icon_anchor=(15, 15)),
     ).add_to(m)
 
+# ---------------------------------------------------------
+# أداة إضافة نقطة عن طريق أيقونة مخصصة (Draw plugin):
+# تظهر أيقونة ماركر بأعلى يسار الخريطة، تضغطها أول، وبعدين تضغط
+# على المكان اللي تبيه بالخريطة عشان تحدد نقطة جديدة - بدل ما أي
+# ضغطة عشوائية بالخريطة تضيف نقطة بالغلط.
+# ---------------------------------------------------------
+Draw(
+    export=False,
+    draw_options={
+        "polyline": False, "polygon": False, "rectangle": False,
+        "circle": False, "circlemarker": False,
+        "marker": True,
+    },
+    edit_options={"edit": False, "remove": False},
+).add_to(m)
+
+folium.LayerControl(position="topright", collapsed=False).add_to(m)
+
 try:
     map_output = st_folium(
         m, width="100%", height=550,
-        returned_objects=["last_clicked", "bounds", "zoom", "center"],
+        center=[center_lat, center_lng], zoom=zoom_level,
+        returned_objects=["last_active_drawing", "bounds", "zoom", "center"],
         key="main_map",
     )
 except Exception as e:
@@ -440,12 +472,18 @@ with refresh_col1:
         st.session_state.pop("focus_location", None)
         st.rerun()
 
-# التقاط ضغطة المستخدم على الخريطة لإضافة نقطة جديدة
-if map_output and map_output.get("last_clicked"):
-    clicked_lat = map_output["last_clicked"]["lat"]
-    clicked_lng = map_output["last_clicked"]["lng"]
-    st.session_state["new_point_location"] = {"lat": clicked_lat, "lng": clicked_lng}
-    st.session_state.pop("focus_location", None)
+# التقاط نقطة جديدة تمت إضافتها عن طريق أيقونة الماركر (Draw tool) بأعلى يسار الخريطة
+# - بدل الاعتماد على أي ضغطة عشوائية بالخريطة، الحين لازم تضغط الأيقونة أول قصدًا
+if map_output and map_output.get("last_active_drawing"):
+    drawing = map_output["last_active_drawing"]
+    if drawing.get("geometry", {}).get("type") == "Point":
+        # GeoJSON يخزن الإحداثيات بترتيب [lng, lat]
+        drawn_lng, drawn_lat = drawing["geometry"]["coordinates"]
+        # نضيف بس لو الموقع تغيّر فعليًا (تفادي إعادة نفس النقطة بكل rerun)
+        current = st.session_state.get("new_point_location")
+        if not current or abs(current["lat"] - drawn_lat) > 1e-9 or abs(current["lng"] - drawn_lng) > 1e-9:
+            st.session_state["new_point_location"] = {"lat": drawn_lat, "lng": drawn_lng}
+            st.session_state.pop("focus_location", None)
 
 # نموذج تعبئة بيانات النقطة الجديدة (التنبيه الرئيسي بمكانه فوق الخريطة)
 if st.session_state.get("new_point_location"):
