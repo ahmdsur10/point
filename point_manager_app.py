@@ -301,22 +301,18 @@ if st.session_state.get("new_point_location"):
 # ---------------------------------------------------------
 # تحديد مركز/تكبير الخريطة:
 # 1) لو فيه نتيجة بحث محددة: نتوسط عليها بزوم قريب
-# 2) غير كذا: نستخدم آخر موقع/تكبير فعلي عرفناه من الخريطة (pending) عشان ما "تقفز"
-#    الخريطة لمكان ثاني كل ما تضغط عليها أو تضيف نقطة
-# 3) لو أول مرة تفتح الصفحة ولسا ما فيه أي شي: قيمة افتراضية (الرياض)
+# 2) لو المستخدم ضغط "إظهار النقاط حسب العرض الحالي": نستخدم آخر موقع محفوظ وقتها
+# 3) غير كذا: قيمة افتراضية (الرياض) - ونخلي الخريطة نفسها (المتصفح) يتحكم بالزوم
+#    والتنقل بعد كذا بدون ما نتدخل، عشان ما نسبب اهتزاز/تصارع مع حركة المستخدم
 # ---------------------------------------------------------
 if st.session_state.get("focus_location"):
     center_lat = st.session_state["focus_location"]["lat"]
     center_lng = st.session_state["focus_location"]["lng"]
     zoom_level = 17
-elif st.session_state.get("pending_center") and st.session_state.get("pending_zoom") is not None:
-    center_lat = st.session_state["pending_center"]["lat"]
-    center_lng = st.session_state["pending_center"]["lng"]
-    zoom_level = st.session_state["pending_zoom"]
-elif st.session_state.get("last_map_center") and st.session_state.get("last_map_zoom") is not None:
+elif st.session_state.get("last_map_center"):
     center_lat = st.session_state["last_map_center"]["lat"]
     center_lng = st.session_state["last_map_center"]["lng"]
-    zoom_level = st.session_state["last_map_zoom"]
+    zoom_level = 15
 else:
     center_lat, center_lng = 24.7136, 46.6753
     zoom_level = 12
@@ -435,8 +431,7 @@ folium.LayerControl(position="topright", collapsed=False).add_to(m)
 try:
     map_output = st_folium(
         m, width="100%", height=550,
-        center=[center_lat, center_lng], zoom=zoom_level,
-        returned_objects=["last_active_drawing", "bounds", "zoom", "center"],
+        returned_objects=["last_active_drawing", "bounds"],
         key="main_map",
     )
 except Exception as e:
@@ -444,31 +439,30 @@ except Exception as e:
     st.error(f"خطأ في عرض الخريطة: {e}")
     st.info("جرب تحدّث المكتبة: pip install --upgrade streamlit-folium folium")
 
-# حفظ حدود/مركز/تكبير الخريطة الحالية للاستخدام لاحقًا - بدون rerun تلقائي
-# (rerun تلقائي مع كل حركة بسيطة كان يسبب ثقل ملحوظ). المستخدم يضغط "تحديث حسب العرض"
-# متى ما يحتاج يشوف نقاط منطقة جديدة بعد ما يحرّك/يكبّر الخريطة - ونحافظ على نفس مستوى التكبير.
-if map_output:
-    if map_output.get("bounds"):
-        b = map_output["bounds"]
-        st.session_state["pending_bounds"] = {
-            "south": b["_southWest"]["lat"], "west": b["_southWest"]["lng"],
-            "north": b["_northEast"]["lat"], "east": b["_northEast"]["lng"],
-        }
-    if map_output.get("zoom") is not None:
-        st.session_state["pending_zoom"] = map_output["zoom"]
-    if map_output.get("center"):
-        st.session_state["pending_center"] = map_output["center"]
+# حفظ حدود الخريطة الحالية (Bounds) للاستخدام لاحقًا - بدون rerun تلقائي ولا إجبار
+# على زوم/مركز معين. المستخدم يضغط "إظهار النقاط..." متى ما يحتاج يحدّث النقاط
+# المعروضة حسب المنطقة الحالية. ملاحظة مهمة: ما نتابع zoom/center من الخريطة
+# ولا نفرضهم مرة ثانية على الخريطة - هذا كان يسبب اهتزاز/تصارع مع تنقل المستخدم
+# الفعلي (كل حركة زوم بسيطة تسبب rerun يعيد فرض زوم قديم يتعارض مع حركته الحالية).
+if map_output and map_output.get("bounds"):
+    b = map_output["bounds"]
+    st.session_state["pending_bounds"] = {
+        "south": b["_southWest"]["lat"], "west": b["_southWest"]["lng"],
+        "north": b["_northEast"]["lat"], "east": b["_northEast"]["lng"],
+    }
 
 refresh_col1, refresh_col2 = st.columns([1, 4])
 with refresh_col1:
     if st.button("👁️ إظهار النقاط حسب العرض الحالي فقط", use_container_width=True):
         if st.session_state.get("pending_bounds"):
-            st.session_state["last_map_bounds"] = st.session_state["pending_bounds"]
-        if st.session_state.get("pending_zoom") is not None:
-            st.session_state["last_map_zoom"] = st.session_state["pending_zoom"]
-        if st.session_state.get("pending_center"):
-            st.session_state["last_map_center"] = st.session_state["pending_center"]
-        # الضغط على تحديث يعني المستخدم يبي يفضل بنفس منطقة/تكبير الخريطة، مو نتيجة بحث قديمة
+            pb = st.session_state["pending_bounds"]
+            st.session_state["last_map_bounds"] = pb
+            # نحسب مركز تقريبي من حدود العرض الحالي بس ما نغيّر مستوى الزوم -
+            # يفضل الزوم زي ما هو بدل ما نفرض رقم قديم يسبب قفزة
+            st.session_state["last_map_center"] = {
+                "lat": (pb["south"] + pb["north"]) / 2,
+                "lng": (pb["west"] + pb["east"]) / 2,
+            }
         st.session_state.pop("focus_location", None)
         st.rerun()
 
