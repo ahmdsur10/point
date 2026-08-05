@@ -47,7 +47,20 @@ FORM_COLUMNS = [
     "درجة_الخطورة",
     "hay_n",
     "baladia",
+    "رابط_الموقع",
+    "الحلول_المقترحة",
+    "الاجراء_المتخذ",
 ]
+
+# الحقول اللي تحتاج صندوق نص كبير (Text Area) بدل حقل نص عادي - نصوص طويلة
+LONG_TEXT_COLUMNS = ["الحلول_المقترحة", "الاجراء_المتخذ"]
+
+
+def render_field_input(col: str, current_value: str, key: str):
+    """يعرض حقل الإدخال المناسب حسب نوع العمود: text_area للنصوص الطويلة، text_input لغيرها."""
+    if col in LONG_TEXT_COLUMNS:
+        return st.text_area(col, value=current_value, key=key, height=100)
+    return st.text_input(col, value=current_value, key=key)
 
 
 @st.cache_resource
@@ -407,7 +420,7 @@ if st.session_state.get("new_point_location"):
     with st.form("map_add_form"):
         map_form_values = {}
         for col in FORM_COLUMNS:
-            map_form_values[col] = st.text_input(col, key=f"map_add_{col}")
+            map_form_values[col] = render_field_input(col, "", key=f"map_add_{col}")
 
         col_save, col_cancel = st.columns(2)
         with col_save:
@@ -446,7 +459,13 @@ with tab_view:
     st.subheader("آخر 200 نقطة مسجلة")
     try:
         df = load_data()
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(
+            df,
+            use_container_width=True,
+            column_config={
+                "رابط_الموقع": st.column_config.LinkColumn("رابط الموقع", display_text="📍 فتح بقوقل ماب")
+            },
+        )
     except Exception as e:
         st.error(f"خطأ في جلب البيانات: {e}")
 
@@ -612,7 +631,7 @@ with tab_add:
 
         form_values = {}
         for col in FORM_COLUMNS:
-            form_values[col] = st.text_input(col, key=f"add_{col}")
+            form_values[col] = render_field_input(col, "", key=f"add_{col}")
 
         submitted = st.form_submit_button("إضافة النقطة")
         if submitted:
@@ -643,8 +662,8 @@ with tab_edit:
                 edit_values = {}
                 for col in FORM_COLUMNS:
                     current_val = row[col] if pd.notna(row[col]) else ""
-                    edit_values[col] = st.text_input(
-                        col, value=str(current_val), key=f"edit_{selected_id}_{col}"
+                    edit_values[col] = render_field_input(
+                        col, str(current_val), key=f"edit_{selected_id}_{col}"
                     )
 
                 update_submitted = st.form_submit_button("حفظ التعديلات")
