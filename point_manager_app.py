@@ -222,6 +222,13 @@ st.markdown("""
             overflow: hidden !important;
             pointer-events: none !important;
         }
+
+        /* نبضة متحركة لعلامة النقطة الجديدة غير المحفوظة على الخريطة */
+        @keyframes pulse-ring {
+            0%   { transform: scale(0.6); opacity: 0.6; }
+            70%  { transform: scale(1.8); opacity: 0; }
+            100% { transform: scale(1.8); opacity: 0; }
+        }
     </style>
 """, unsafe_allow_html=True)
 
@@ -279,15 +286,33 @@ if not search_results.empty:
     }
 
 # ---------------------------------------------------------
+# تنبيه بارز أعلى الخريطة لو فيه نقطة جديدة لسا ما انحفظت
+# (يفضل ظاهر مهما تنقلت بالخريطة، عشان ما تنسى تكمل حفظها)
+# ---------------------------------------------------------
+if st.session_state.get("new_point_location"):
+    pending = st.session_state["new_point_location"]
+    st.warning(
+        f"⚠️ **عندك نقطة جديدة لسا ما انحفظت!** "
+        f"(الموقع: {pending['lat']:.5f}, {pending['lng']:.5f}) — "
+        f"بانها بالخريطة بعلامة 🔴 كبيرة. عبّي البيانات بالنموذج تحت الخريطة واضغط «حفظ النقطة»، "
+        f"أو اضغط «إلغاء التحديد» لو ضغطت بالغلط."
+    )
+
+# ---------------------------------------------------------
 # تحديد مركز/تكبير الخريطة:
 # 1) لو فيه نتيجة بحث محددة: نتوسط عليها بزوم قريب
-# 2) لو المستخدم سوى "تحديث حسب العرض الحالي": نحافظ على نفس مركز وتكبير الخريطة كما هو
-# 3) غير كذا: نستخدم قيمة افتراضية (الرياض)
+# 2) غير كذا: نستخدم آخر موقع/تكبير فعلي عرفناه من الخريطة (pending) عشان ما "تقفز"
+#    الخريطة لمكان ثاني كل ما تضغط عليها أو تضيف نقطة
+# 3) لو أول مرة تفتح الصفحة ولسا ما فيه أي شي: قيمة افتراضية (الرياض)
 # ---------------------------------------------------------
 if st.session_state.get("focus_location"):
     center_lat = st.session_state["focus_location"]["lat"]
     center_lng = st.session_state["focus_location"]["lng"]
     zoom_level = 17
+elif st.session_state.get("pending_center") and st.session_state.get("pending_zoom") is not None:
+    center_lat = st.session_state["pending_center"]["lat"]
+    center_lng = st.session_state["pending_center"]["lng"]
+    zoom_level = st.session_state["pending_zoom"]
 elif st.session_state.get("last_map_center") and st.session_state.get("last_map_zoom") is not None:
     center_lat = st.session_state["last_map_center"]["lat"]
     center_lng = st.session_state["last_map_center"]["lng"]
@@ -356,14 +381,24 @@ if st.session_state.get("focus_location"):
         icon=folium.Icon(color="green", icon="star", prefix="fa"),
     ).add_to(m)
 
-# لو فيه موقع جديد محدد (مو محفوظ بعد)، نعرضه بلون مختلف
+# لو فيه موقع جديد محدد (مو محفوظ بعد)، نعرضه بعلامة نابضة كبيرة وواضحة جدًا
 if st.session_state.get("new_point_location"):
     new_lat = st.session_state["new_point_location"]["lat"]
     new_lng = st.session_state["new_point_location"]["lng"]
+    pulse_html = """
+    <div style="position:relative; width:30px; height:30px;">
+        <div style="position:absolute; top:0; left:0; width:30px; height:30px;
+                    background:#e53935; border-radius:50%; opacity:0.55;
+                    animation: pulse-ring 1.4s ease-out infinite;"></div>
+        <div style="position:absolute; top:8px; left:8px; width:14px; height:14px;
+                    background:#e53935; border:2px solid white; border-radius:50%;
+                    box-shadow:0 0 6px rgba(0,0,0,0.6);"></div>
+    </div>
+    """
     folium.Marker(
         location=[new_lat, new_lng],
-        tooltip="نقطة جديدة (لم تُحفظ بعد)",
-        icon=folium.Icon(color="red", icon="plus", prefix="fa"),
+        tooltip="🔴 نقطة جديدة - لم تُحفظ بعد",
+        icon=folium.DivIcon(html=pulse_html, icon_size=(30, 30), icon_anchor=(15, 15)),
     ).add_to(m)
 
 try:
@@ -394,7 +429,7 @@ if map_output:
 
 refresh_col1, refresh_col2 = st.columns([1, 4])
 with refresh_col1:
-    if st.button("🔄 تحديث حسب العرض الحالي", use_container_width=True):
+    if st.button("👁️ إظهار النقاط حسب العرض الحالي فقط", use_container_width=True):
         if st.session_state.get("pending_bounds"):
             st.session_state["last_map_bounds"] = st.session_state["pending_bounds"]
         if st.session_state.get("pending_zoom") is not None:
@@ -412,10 +447,10 @@ if map_output and map_output.get("last_clicked"):
     st.session_state["new_point_location"] = {"lat": clicked_lat, "lng": clicked_lng}
     st.session_state.pop("focus_location", None)
 
-# لو فيه موقع محدد، اعرض نموذج تعبئة البيانات تحت الخريطة
+# نموذج تعبئة بيانات النقطة الجديدة (التنبيه الرئيسي بمكانه فوق الخريطة)
 if st.session_state.get("new_point_location"):
     loc = st.session_state["new_point_location"]
-    st.info(f"📍 الموقع المحدد: Lat = {loc['lat']:.6f}, Lng = {loc['lng']:.6f}")
+    st.markdown("### 📝 عبّي بيانات النقطة الجديدة")
 
     with st.form("map_add_form"):
         map_form_values = {}
