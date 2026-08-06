@@ -4,3 +4,5 @@ sqlalchemy>=2.0
 psycopg[binary]
 folium
 streamlit-folium
+openpyxl
+pyshp
