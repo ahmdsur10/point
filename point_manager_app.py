@@ -18,6 +18,8 @@
 """
 
 import re
+import io
+import zipfile
 
 import streamlit as st
 import pandas as pd
@@ -25,6 +27,12 @@ import folium
 from folium.plugins import FastMarkerCluster, Draw
 from streamlit_folium import st_folium
 from sqlalchemy import text, create_engine
+
+try:
+    import shapefile  # مكتبة pyshp - قراءة شيب فايل بدون الحاجة لـ GDAL
+    SHAPEFILE_AVAILABLE = True
+except ImportError:
+    SHAPEFILE_AVAILABLE = False
 
 # =========================================================
 # 1) إعداد الاتصال (Engine عادي متزامن، محفوظ بالـ cache مرة وحدة)
@@ -175,6 +183,33 @@ def insert_point(lat, lng, values: dict):
     sql = f'INSERT INTO {TABLE_NAME} ({col_list}) VALUES ({", ".join(val_list)})'
     params = {"lng": lng, "lat": lat, "input_srid": INPUT_SRID, "table_srid": TABLE_SRID, **values}
     _execute(sql, params)
+
+
+def bulk_insert_points(records: list, source_srid: int):
+    """إدخال جماعي لعدة نقاط دفعة وحدة - يستخدم للاستيراد من Excel/Shapefile.
+    records: قائمة قواميس، كل واحد فيها لازم يحتوي 'x' و 'y' (إحداثيات بنظام source_srid)
+             + أي أعمدة إضافية من FORM_COLUMNS (اختياري).
+    يرجع (عدد النجاح, قائمة الأخطاء [(رقم الصف, رسالة الخطأ), ...])"""
+    engine = get_engine()
+    success_count = 0
+    errors = []
+    with engine.connect() as conn:
+        for i, rec in enumerate(records):
+            try:
+                extra_cols = [k for k in rec.keys() if k not in ("x", "y")]
+                cols = [GEOM_COLUMN] + extra_cols
+                col_list = ", ".join(f'"{c}"' for c in cols)
+                val_list = ["ST_Transform(ST_SetSRID(ST_MakePoint(:x, :y), :src_srid), :table_srid)"] + [f":{k}" for k in extra_cols]
+                sql = f'INSERT INTO {TABLE_NAME} ({col_list}) VALUES ({", ".join(val_list)})'
+                params = {"x": rec["x"], "y": rec["y"], "src_srid": source_srid, "table_srid": TABLE_SRID}
+                for k in extra_cols:
+                    params[k] = rec[k]
+                conn.execute(text(sql), params)
+                success_count += 1
+            except Exception as e:
+                errors.append((i + 1, str(e)))
+        conn.commit()
+    return success_count, errors
 
 
 def update_point(pk_value, values: dict):
@@ -523,8 +558,8 @@ st.divider()
 # =========================================================
 # باقي الوظائف تحت بالتبويبات (عرض / إضافة يدوي / تعديل / حذف)
 # =========================================================
-tab_view, tab_sql, tab_add, tab_edit, tab_delete = st.tabs(
-    ["📋 عرض البيانات", "🧮 استعلام SQL", "➕ إضافة نقطة (يدوي)", "✏️ تعديل نقطة", "🗑️ حذف نقطة"]
+tab_view, tab_sql, tab_import, tab_add, tab_edit, tab_delete = st.tabs(
+    ["📋 عرض البيانات", "🧮 استعلام SQL", "📤 استيراد جماعي", "➕ إضافة نقطة (يدوي)", "✏️ تعديل نقطة", "🗑️ حذف نقطة"]
 )
 
 # ---------------- تبويب العرض ----------------
@@ -691,6 +726,188 @@ with tab_sql:
             "⬇️ Export Selection (CSV)", data=csv_bytes,
             file_name="query_result.csv", mime="text/csv",
         )
+
+# ---------------- تبويب الاستيراد الجماعي ----------------
+with tab_import:
+    st.subheader("📤 استيراد عدة نقاط دفعة وحدة")
+    st.caption("ارفع ملف Excel/CSV أو Shapefile (كملف ZIP) يحتوي عدة نقاط، وحدد نظام الإحداثيات وربط الأعمدة، ثم استورد الكل مرة وحدة.")
+
+    import_source = st.radio(
+        "مصدر البيانات:", ["📊 Excel / CSV", "🗺️ Shapefile (ملف ZIP)"],
+        horizontal=True, key="import_source_type",
+    )
+
+    SRID_OPTIONS = {
+        "WGS84 (4326) - إحداثيات lat/long عادية بالدرجات": 4326,
+        "Ain el Abd 1970 UTM Zone 38N (20438) - نفس نظام الجدول": 20438,
+    }
+
+    # =====================================================
+    # الاستيراد من Excel / CSV
+    # =====================================================
+    if import_source == "📊 Excel / CSV":
+        uploaded_file = st.file_uploader(
+            "ارفع ملف Excel (.xlsx) أو CSV", type=["xlsx", "xls", "csv"], key="excel_uploader"
+        )
+
+        if uploaded_file:
+            try:
+                if uploaded_file.name.lower().endswith(".csv"):
+                    raw_df = pd.read_csv(uploaded_file)
+                else:
+                    raw_df = pd.read_excel(uploaded_file)
+
+                st.success(f"✅ تم تحميل الملف - {len(raw_df)} صف")
+                st.dataframe(raw_df.head(20), use_container_width=True)
+
+                available_cols = raw_df.columns.tolist()
+
+                st.markdown("#### 1️⃣ حدد أعمدة الإحداثيات ونظامها")
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    x_col = st.selectbox("عمود X / Longitude", available_cols, key="excel_x_col")
+                with c2:
+                    y_col = st.selectbox("عمود Y / Latitude", available_cols, key="excel_y_col")
+                with c3:
+                    srid_label = st.selectbox("نظام إحداثيات الملف", list(SRID_OPTIONS.keys()), key="excel_srid")
+                source_srid = SRID_OPTIONS[srid_label]
+
+                st.markdown("#### 2️⃣ اربط أعمدة الملف بحقول الجدول (اختياري)")
+                st.caption("لو أسماء الأعمدة بالملف مطابقة لأسماء الحقول، بيتم ربطها تلقائيًا.")
+                field_mapping = {}
+                map_cols = st.columns(3)
+                for i, form_col in enumerate(FORM_COLUMNS):
+                    options = ["-- تجاهل --"] + available_cols
+                    default_idx = options.index(form_col) if form_col in available_cols else 0
+                    with map_cols[i % 3]:
+                        field_mapping[form_col] = st.selectbox(
+                            form_col, options, index=default_idx, key=f"excel_map_{form_col}"
+                        )
+
+                st.divider()
+                if st.button("🚀 استيراد كل النقاط", type="primary", key="excel_import_btn"):
+                    records = []
+                    for _, row in raw_df.iterrows():
+                        rec = {}
+                        try:
+                            rec["x"] = float(row[x_col])
+                            rec["y"] = float(row[y_col])
+                        except (ValueError, TypeError):
+                            continue  # نتجاهل صفوف بدون إحداثيات صحيحة
+                        for form_col, src_col in field_mapping.items():
+                            if src_col != "-- تجاهل --" and pd.notna(row[src_col]):
+                                rec[form_col] = str(row[src_col])
+                        records.append(rec)
+
+                    if not records:
+                        st.error("❌ ما فيه صفوف تحتوي إحداثيات صالحة للاستيراد")
+                    else:
+                        with st.spinner(f"جاري استيراد {len(records)} نقطة..."):
+                            success_count, errors = bulk_insert_points(records, source_srid)
+
+                        st.success(f"✅ تم استيراد {success_count} من {len(records)} نقطة بنجاح")
+                        if errors:
+                            st.warning(f"⚠️ فشل استيراد {len(errors)} صف")
+                            with st.expander("عرض تفاصيل الأخطاء"):
+                                for row_num, err in errors:
+                                    st.text(f"صف {row_num}: {err}")
+
+                        load_map_data.clear()
+                        load_points_in_bounds.clear()
+                        search_points.clear()
+
+            except Exception as e:
+                st.error(f"❌ خطأ بقراءة الملف: {e}")
+
+    # =====================================================
+    # الاستيراد من Shapefile (ZIP)
+    # =====================================================
+    else:
+        if not SHAPEFILE_AVAILABLE:
+            st.error("❌ مكتبة قراءة الشيب فايل (pyshp) مو مثبتة. أضف السطر التالي لملف requirements.txt:\n\n`pyshp`\n\nثم أعد نشر التطبيق.")
+        else:
+            st.caption("ارفع ملف ZIP يحتوي أطراف الشيب فايل: .shp و .shx و .dbf على الأقل (نفس الاسم لكل الملفات). مدعوم بس نوع Point.")
+            uploaded_zip = st.file_uploader("ارفع ملف ZIP", type=["zip"], key="shp_uploader")
+
+            if uploaded_zip:
+                try:
+                    zf = zipfile.ZipFile(uploaded_zip)
+                    names = zf.namelist()
+
+                    shp_name = next((n for n in names if n.lower().endswith(".shp")), None)
+                    shx_name = next((n for n in names if n.lower().endswith(".shx")), None)
+                    dbf_name = next((n for n in names if n.lower().endswith(".dbf")), None)
+
+                    if not (shp_name and dbf_name):
+                        st.error("❌ الملف ما يحتوي .shp و .dbf المطلوبين")
+                    else:
+                        shp_io = io.BytesIO(zf.read(shp_name))
+                        dbf_io = io.BytesIO(zf.read(dbf_name))
+                        shx_io = io.BytesIO(zf.read(shx_name)) if shx_name else None
+
+                        reader = shapefile.Reader(shp=shp_io, shx=shx_io, dbf=dbf_io)
+
+                        if reader.shapeType not in (shapefile.POINT, shapefile.POINTZ, shapefile.POINTM):
+                            st.error(f"❌ نوع الشيب فايل غير مدعوم حاليًا (لازم يكون Point). النوع الحالي: {reader.shapeTypeName}")
+                        else:
+                            field_names = [f[0] for f in reader.fields[1:]]  # أول عنصر هو DeletionFlag، نتجاهله
+                            records_raw = []
+                            for shape_rec in reader.iterShapeRecords():
+                                geom = shape_rec.shape
+                                if not geom.points:
+                                    continue
+                                x, y = geom.points[0]
+                                row = dict(zip(field_names, shape_rec.record))
+                                row["_x"] = x
+                                row["_y"] = y
+                                records_raw.append(row)
+
+                            shp_df = pd.DataFrame(records_raw)
+                            st.success(f"✅ تم تحميل الشيب فايل - {len(shp_df)} نقطة")
+                            st.dataframe(shp_df.head(20), use_container_width=True)
+
+                            st.markdown("#### 1️⃣ حدد نظام إحداثيات الشيب فايل")
+                            srid_label = st.selectbox("نظام الإحداثيات", list(SRID_OPTIONS.keys()), key="shp_srid")
+                            source_srid = SRID_OPTIONS[srid_label]
+                            st.caption("💡 تأكد من نظام الإحداثيات الصحيح للشيب فايل (تقدر تشوفه بملف .prj لو موجود) عشان النقاط ما تنزل بمكان غلط.")
+
+                            st.markdown("#### 2️⃣ اربط حقول الشيب فايل بحقول الجدول (اختياري)")
+                            field_mapping = {}
+                            map_cols = st.columns(3)
+                            for i, form_col in enumerate(FORM_COLUMNS):
+                                options = ["-- تجاهل --"] + field_names
+                                default_idx = options.index(form_col) if form_col in field_names else 0
+                                with map_cols[i % 3]:
+                                    field_mapping[form_col] = st.selectbox(
+                                        form_col, options, index=default_idx, key=f"shp_map_{form_col}"
+                                    )
+
+                            st.divider()
+                            if st.button("🚀 استيراد كل النقاط", type="primary", key="shp_import_btn"):
+                                records = []
+                                for row in records_raw:
+                                    rec = {"x": row["_x"], "y": row["_y"]}
+                                    for form_col, src_field in field_mapping.items():
+                                        if src_field != "-- تجاهل --" and row.get(src_field) not in (None, ""):
+                                            rec[form_col] = str(row[src_field])
+                                    records.append(rec)
+
+                                with st.spinner(f"جاري استيراد {len(records)} نقطة..."):
+                                    success_count, errors = bulk_insert_points(records, source_srid)
+
+                                st.success(f"✅ تم استيراد {success_count} من {len(records)} نقطة بنجاح")
+                                if errors:
+                                    st.warning(f"⚠️ فشل استيراد {len(errors)} صف")
+                                    with st.expander("عرض تفاصيل الأخطاء"):
+                                        for row_num, err in errors:
+                                            st.text(f"صف {row_num}: {err}")
+
+                                load_map_data.clear()
+                                load_points_in_bounds.clear()
+                                search_points.clear()
+
+                except Exception as e:
+                    st.error(f"❌ خطأ بقراءة ملف الشيب فايل: {e}")
 
 # ---------------- تبويب الإضافة ----------------
 with tab_add:
