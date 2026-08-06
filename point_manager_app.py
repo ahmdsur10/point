@@ -431,7 +431,7 @@ folium.LayerControl(position="topright", collapsed=False).add_to(m)
 try:
     map_output = st_folium(
         m, width="100%", height=550,
-        returned_objects=["last_active_drawing", "bounds"],
+        returned_objects=["all_drawings", "bounds"],
         key="main_map",
     )
 except Exception as e:
@@ -469,26 +469,21 @@ with refresh_col1:
 # التقاط نقطة جديدة تمت إضافتها عن طريق أيقونة الماركر (Draw tool) بأعلى يسار الخريطة
 # - بدل الاعتماد على أي ضغطة عشوائية بالخريطة، الحين لازم تضغط الأيقونة أول قصدًا
 #
-# ملاحظة مهمة: الماركر اللي ترسمه بأداة Draw يفضل موجود بذاكرة مكوّن الخريطة حتى
-# بعد ما نحفظه أو نلغيه (ما عندنا وسيلة نمسحه منها برمجيًا)، فأي rerun ثاني يصير
-# لأي سبب (حتى مجرد فتح popup لنقطة موجودة) ممكن "يرجّع" نفس الرسمة القديمة.
-# عشان كذا نتتبع آخر رسمة عالجناها فعليًا بشكل مستقل (handled_drawing_coords)،
-# بدل ما نقارن بس مع new_point_location اللي ينمسح بعد الحفظ/الإلغاء.
-if map_output and map_output.get("last_active_drawing"):
-    drawing = map_output["last_active_drawing"]
-    if drawing.get("geometry", {}).get("type") == "Point":
-        # GeoJSON يخزن الإحداثيات بترتيب [lng, lat]
-        drawn_lng, drawn_lat = drawing["geometry"]["coordinates"]
-        handled = st.session_state.get("handled_drawing_coords")
-        is_new_drawing = (
-            not handled
-            or abs(handled[0] - drawn_lat) > 1e-9
-            or abs(handled[1] - drawn_lng) > 1e-9
-        )
-        if is_new_drawing:
-            st.session_state["handled_drawing_coords"] = (drawn_lat, drawn_lng)
+# ملاحظة مهمة: نعتمد على "عدد" الرسومات الكلي (all_drawings) بدل آخر رسمة لحالها
+# (last_active_drawing) - لأن الأخيرة ممكن "تترجع" من جديد بذاكرة المكوّن حتى بعد
+# ما نعالجها، حتى لو كان السبب مجرد فتح popup لنقطة موجودة. بمقارنة العدد فقط،
+# نتأكد 100% إن فيه رسمة جديدة فعلية صارت (العدد زاد)، مو مجرد إعادة إرسال قديمة.
+if map_output and map_output.get("all_drawings"):
+    drawings = map_output["all_drawings"]
+    last_count = st.session_state.get("drawings_count", 0)
+    if len(drawings) > last_count:
+        newest = drawings[-1]
+        if newest.get("geometry", {}).get("type") == "Point":
+            # GeoJSON يخزن الإحداثيات بترتيب [lng, lat]
+            drawn_lng, drawn_lat = newest["geometry"]["coordinates"]
             st.session_state["new_point_location"] = {"lat": drawn_lat, "lng": drawn_lng}
             st.session_state.pop("focus_location", None)
+        st.session_state["drawings_count"] = len(drawings)
 
 # نموذج تعبئة بيانات النقطة الجديدة (التنبيه الرئيسي بمكانه فوق الخريطة)
 if st.session_state.get("new_point_location"):
