@@ -370,7 +370,7 @@ if not map_df.empty:
             radius: 7, color: '#1a73e8', fillColor: '#1a73e8',
             fillOpacity: 0.85, weight: 1
         });
-        marker.bindPopup(row[2]);
+        marker.bindPopup(row[2], {autoPan: false});
         return marker;
     }
     """
@@ -468,14 +468,25 @@ with refresh_col1:
 
 # التقاط نقطة جديدة تمت إضافتها عن طريق أيقونة الماركر (Draw tool) بأعلى يسار الخريطة
 # - بدل الاعتماد على أي ضغطة عشوائية بالخريطة، الحين لازم تضغط الأيقونة أول قصدًا
+#
+# ملاحظة مهمة: الماركر اللي ترسمه بأداة Draw يفضل موجود بذاكرة مكوّن الخريطة حتى
+# بعد ما نحفظه أو نلغيه (ما عندنا وسيلة نمسحه منها برمجيًا)، فأي rerun ثاني يصير
+# لأي سبب (حتى مجرد فتح popup لنقطة موجودة) ممكن "يرجّع" نفس الرسمة القديمة.
+# عشان كذا نتتبع آخر رسمة عالجناها فعليًا بشكل مستقل (handled_drawing_coords)،
+# بدل ما نقارن بس مع new_point_location اللي ينمسح بعد الحفظ/الإلغاء.
 if map_output and map_output.get("last_active_drawing"):
     drawing = map_output["last_active_drawing"]
     if drawing.get("geometry", {}).get("type") == "Point":
         # GeoJSON يخزن الإحداثيات بترتيب [lng, lat]
         drawn_lng, drawn_lat = drawing["geometry"]["coordinates"]
-        # نضيف بس لو الموقع تغيّر فعليًا (تفادي إعادة نفس النقطة بكل rerun)
-        current = st.session_state.get("new_point_location")
-        if not current or abs(current["lat"] - drawn_lat) > 1e-9 or abs(current["lng"] - drawn_lng) > 1e-9:
+        handled = st.session_state.get("handled_drawing_coords")
+        is_new_drawing = (
+            not handled
+            or abs(handled[0] - drawn_lat) > 1e-9
+            or abs(handled[1] - drawn_lng) > 1e-9
+        )
+        if is_new_drawing:
+            st.session_state["handled_drawing_coords"] = (drawn_lat, drawn_lng)
             st.session_state["new_point_location"] = {"lat": drawn_lat, "lng": drawn_lng}
             st.session_state.pop("focus_location", None)
 
