@@ -212,6 +212,15 @@ def bulk_insert_points(records: list, source_srid: int):
     return success_count, errors
 
 
+def get_point_by_id(pk_value):
+    """يجيب نقطة واحدة بالضبط برقم gis_oid من كامل الجدول (بدون حد أقصى للبحث،
+    بعكس load_data اللي تجيب بس آخر 200 نقطة). يستخدم بتبويب التعديل عشان تقدر
+    تعدل أي نقطة بالجدول كامل مو بس النقاط الأخيرة."""
+    cols = ", ".join([PK_COLUMN] + FORM_COLUMNS)
+    sql = f"SELECT {cols} FROM {TABLE_NAME} WHERE {PK_COLUMN} = :pk_value"
+    return _fetch_df(sql, {"pk_value": pk_value})
+
+
 def update_point(pk_value, values: dict):
     set_clause = ", ".join(f'"{k}" = :{k}' for k in values.keys())
     sql = f'UPDATE {TABLE_NAME} SET {set_clause} WHERE {PK_COLUMN} = :pk_value'
@@ -222,6 +231,23 @@ def update_point(pk_value, values: dict):
 def delete_point(pk_value):
     sql = f"DELETE FROM {TABLE_NAME} WHERE {PK_COLUMN} = :pk_value"
     _execute(sql, {"pk_value": pk_value})
+
+
+def delete_points(pk_values: list):
+    """حذف عدة نقاط دفعة وحدة برقم gis_oid. يرجع (عدد النجاح, قائمة الأخطاء)."""
+    engine = get_engine()
+    success_count = 0
+    errors = []
+    with engine.connect() as conn:
+        for pk_value in pk_values:
+            try:
+                sql = f"DELETE FROM {TABLE_NAME} WHERE {PK_COLUMN} = :pk_value"
+                conn.execute(text(sql), {"pk_value": pk_value})
+                success_count += 1
+            except Exception as e:
+                errors.append((pk_value, str(e)))
+        conn.commit()
+    return success_count, errors
 
 
 # =========================================================
@@ -389,12 +415,14 @@ folium.TileLayer(
 # كود JS مضغوط جدًا بدل ما ينشئ عنصر HTML/DOM كامل لكل نقطة بشكل منفصل.
 # هذا أسرع بشكل ملحوظ مع مئات/آلاف النقاط.
 if not map_df.empty:
-    # نبني للـ popup أهم عمودين/ثلاثة بس (بدل كل الأعمدة) عشان يفضل حجم البيانات المرسلة صغير وسريع
+    # نبني للـ popup: رقم gis_oid دايمًا بالأعلى (يسهّل نسخه للاستعلام/التعديل/الحذف)
+    # + أهم عمودين/ثلاثة إضافيين بس (بدل كل الأعمدة) عشان يفضل حجم البيانات المرسلة صغير وسريع
     popup_cols = FORM_COLUMNS[:3]
 
     def build_row(row):
-        parts = [f"<b>{c}:</b> {row[c]}" for c in popup_cols if pd.notna(row[c]) and row[c] != ""]
-        popup_text = "<br>".join(parts) if parts else f"{PK_COLUMN}: {row[PK_COLUMN]}"
+        parts = [f"<b>{PK_COLUMN}:</b> {row[PK_COLUMN]}"]
+        parts += [f"<b>{c}:</b> {row[c]}" for c in popup_cols if pd.notna(row[c]) and row[c] != ""]
+        popup_text = "<br>".join(parts)
         return [row["map_lat"], row["map_lng"], popup_text]
 
     cluster_data = [build_row(row) for _, row in map_df.iterrows()]
@@ -934,63 +962,124 @@ with tab_add:
 
 # ---------------- تبويب التعديل ----------------
 with tab_edit:
-    st.subheader("تعديل نقطة موجودة")
-    try:
-        df_edit = load_data()
-        if not df_edit.empty:
-            selected_id = st.selectbox(
-                f"اختر {PK_COLUMN}", df_edit[PK_COLUMN].tolist(), key="edit_select"
-            )
-            row = df_edit[df_edit[PK_COLUMN] == selected_id].iloc[0]
+    st.subheader("تعديل نقطة (من كامل الجدول)")
+    st.caption(f"أدخل رقم {PK_COLUMN} للنقطة اللي تبي تعدلها - يشتغل مع أي نقطة بالجدول، مو بس آخر 200.")
 
-            st.info(f"📝 البيانات الحالية للنقطة رقم {selected_id} - عدّل الحقل اللي تبيه بس واترك الباقي كما هو")
+    id_col, btn_col = st.columns([2, 1])
+    with id_col:
+        selected_id = st.number_input(
+            f"رقم {PK_COLUMN}", min_value=0, step=1, value=0, key="edit_id_input"
+        )
+    with btn_col:
+        st.write("")
+        st.write("")
+        load_clicked = st.button("🔍 تحميل بيانات النقطة", use_container_width=True)
 
-            # مهم: نربط مفتاح كل حقل برقم النقطة نفسها (selected_id)، مو بس باسم العمود.
-            # لو المفتاح ثابت بين كل النقاط، Streamlit يحتفظ بالقيمة القديمة اللي كتبتها
-            # لنقطة سابقة وما يحدّثها للنقطة الجديدة المختارة.
-            with st.form(f"edit_form_{selected_id}"):
-                edit_values = {}
-                for col in FORM_COLUMNS:
-                    current_val = row[col] if pd.notna(row[col]) else ""
-                    edit_values[col] = render_field_input(
-                        col, str(current_val), key=f"edit_{selected_id}_{col}"
-                    )
-
-                update_submitted = st.form_submit_button("حفظ التعديلات")
-                if update_submitted:
-                    try:
-                        update_point(selected_id, edit_values)
-                        st.success("✅ تم التعديل بنجاح")
-                        load_map_data.clear()
-                        load_points_in_bounds.clear()
-                        search_points.clear()
-                    except Exception as e:
-                        st.error(f"❌ فشل التعديل: {e}")
+    if load_clicked:
+        if selected_id <= 0:
+            st.warning("⚠️ أدخل رقم صحيح أكبر من صفر")
+            st.session_state.pop("edit_loaded_row", None)
         else:
-            st.info("ما فيه بيانات حاليًا")
-    except Exception as e:
-        st.error(f"خطأ: {e}")
+            try:
+                result = get_point_by_id(selected_id)
+                if result.empty:
+                    st.error(f"❌ ما فيه نقطة بالرقم {selected_id}")
+                    st.session_state.pop("edit_loaded_row", None)
+                else:
+                    st.session_state["edit_loaded_row"] = result.iloc[0].to_dict()
+                    st.session_state["edit_loaded_id"] = int(selected_id)
+            except Exception as e:
+                st.error(f"❌ خطأ: {e}")
+                st.session_state.pop("edit_loaded_row", None)
 
-# ---------------- تبويب الحذف ----------------
-with tab_delete:
-    st.subheader("حذف نقطة")
-    try:
-        df_del = load_data()
-        if not df_del.empty:
-            delete_id = st.selectbox(
-                f"اختر {PK_COLUMN} للحذف", df_del[PK_COLUMN].tolist(), key="delete_select"
-            )
-            st.warning("⚠️ هذا الإجراء لا يمكن التراجع عنه")
-            if st.button("تأكيد الحذف", type="primary"):
+    # نعرض نموذج التعديل بس لو فيه نقطة محمّلة فعليًا وتطابق الرقم المدخل حاليًا
+    if st.session_state.get("edit_loaded_row") and st.session_state.get("edit_loaded_id") == int(selected_id):
+        row = st.session_state["edit_loaded_row"]
+        loaded_id = st.session_state["edit_loaded_id"]
+
+        st.info(f"📝 البيانات الحالية للنقطة رقم {loaded_id} - عدّل الحقل اللي تبيه بس واترك الباقي كما هو")
+
+        # مهم: نربط مفتاح كل حقل برقم النقطة نفسها (loaded_id)، مو بس باسم العمود.
+        # لو المفتاح ثابت بين كل النقاط، Streamlit يحتفظ بالقيمة القديمة اللي كتبتها
+        # لنقطة سابقة وما يحدّثها للنقطة الجديدة المختارة.
+        with st.form(f"edit_form_{loaded_id}"):
+            edit_values = {}
+            for col in FORM_COLUMNS:
+                current_val = row.get(col) if pd.notna(row.get(col)) else ""
+                edit_values[col] = render_field_input(
+                    col, str(current_val), key=f"edit_{loaded_id}_{col}"
+                )
+
+            update_submitted = st.form_submit_button("💾 حفظ التعديلات", type="primary")
+            if update_submitted:
                 try:
-                    delete_point(delete_id)
-                    st.success("✅ تم الحذف بنجاح")
+                    update_point(loaded_id, edit_values)
+                    st.success("✅ تم التعديل بنجاح")
                     load_map_data.clear()
                     load_points_in_bounds.clear()
                     search_points.clear()
+                    st.session_state.pop("edit_loaded_row", None)
+                    st.rerun()
                 except Exception as e:
-                    st.error(f"❌ فشل الحذف: {e}")
+                    st.error(f"❌ فشل التعديل: {e}")
+
+# ---------------- تبويب الحذف ----------------
+with tab_delete:
+    st.subheader("🗑️ حذف نقطة أو عدة نقاط")
+
+    st.markdown("#### 1️⃣ اختر من آخر 200 نقطة (اختياري)")
+    try:
+        df_del = load_data()
+        multiselect_ids = []
+        if not df_del.empty:
+            multiselect_ids = st.multiselect(
+                f"اختر عدة أرقام {PK_COLUMN} للحذف",
+                df_del[PK_COLUMN].tolist(),
+                key="delete_multiselect",
+            )
         else:
             st.info("ما فيه بيانات حاليًا")
     except Exception as e:
-        st.error(f"خطأ: {e}")
+        multiselect_ids = []
+        st.error(f"خطأ بجلب البيانات: {e}")
+
+    st.markdown("#### 2️⃣ أو اكتب أرقام يدويًا (يشتغل مع أي نقطة بكامل الجدول)")
+    manual_ids_text = st.text_input(
+        f"أرقام {PK_COLUMN} مفصولة بفاصلة (مثال: 5, 102, 900)", key="delete_manual_ids"
+    )
+
+    # ندمج الأرقام من الطريقتين (المختارة + المكتوبة يدويًا) بدون تكرار
+    manual_ids = []
+    if manual_ids_text.strip():
+        for part in manual_ids_text.split(","):
+            part = part.strip()
+            if part.isdigit():
+                manual_ids.append(int(part))
+
+    all_ids_to_delete = sorted(set(multiselect_ids) | set(manual_ids))
+
+    if all_ids_to_delete:
+        st.markdown("#### 3️⃣ تأكيد الحذف")
+        st.warning(f"⚠️ راح يتم حذف **{len(all_ids_to_delete)}** نقطة: {', '.join(map(str, all_ids_to_delete))}")
+        st.caption("هذا الإجراء لا يمكن التراجع عنه")
+
+        confirm = st.checkbox("أنا متأكد إني أبي أحذف هذي النقاط", key="delete_confirm_checkbox")
+
+        if st.button("🗑️ تأكيد الحذف النهائي", type="primary", disabled=not confirm):
+            try:
+                success_count, errors = delete_points(all_ids_to_delete)
+                st.success(f"✅ تم حذف {success_count} من {len(all_ids_to_delete)} نقطة بنجاح")
+                if errors:
+                    st.warning(f"⚠️ فشل حذف {len(errors)} نقطة")
+                    with st.expander("عرض تفاصيل الأخطاء"):
+                        for pk_val, err in errors:
+                            st.text(f"{PK_COLUMN} = {pk_val}: {err}")
+
+                load_map_data.clear()
+                load_points_in_bounds.clear()
+                search_points.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ فشل الحذف: {e}")
+    else:
+        st.info("اختر أو اكتب رقم/أرقام النقاط اللي تبي تحذفها")
