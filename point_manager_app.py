@@ -379,22 +379,29 @@ else:
     zoom_level = 12
 
 # ---------------------------------------------------------
-# جلب النقاط: حسب حدود الخريطة الحالية (Viewport) لو متوفرة، وإلا نستخدم مجموعة افتراضية
+# جلب النقاط: نعرض الخريطة فاضية أول ما تفتح، ولا نجيب أي نقاط
+# إلا بعد ما المستخدم يكبّر/يحرّك للمنطقة اللي تبيه ويضغط زر
+# "إظهار النقاط حسب العرض الحالي فقط" تحت الخريطة (اللي يحدد last_map_bounds).
 # ---------------------------------------------------------
 last_bounds = st.session_state.get("last_map_bounds")
-try:
-    if last_bounds:
+map_df = pd.DataFrame()
+if last_bounds:
+    try:
         map_df = load_points_in_bounds(
             last_bounds["south"], last_bounds["west"],
             last_bounds["north"], last_bounds["east"],
         )
-    else:
-        map_df = load_map_data()
-except Exception as e:
-    map_df = pd.DataFrame()
-    st.error(f"خطأ في جلب بيانات الخريطة: {e}")
+    except Exception as e:
+        map_df = pd.DataFrame()
+        st.error(f"خطأ في جلب بيانات الخريطة: {e}")
 
-st.caption(f"📍 عدد النقاط الظاهرة حاليًا: {len(map_df)}")
+if last_bounds:
+    st.caption(f"📍 عدد النقاط الظاهرة حاليًا: {len(map_df)}")
+else:
+    st.info(
+        "🔍 الخريطة فاضية حاليًا. كبّر/حرّك للمنطقة اللي تبيها، "
+        "ثم اضغط زر «👁️ إظهار النقاط حسب العرض الحالي فقط» تحت الخريطة عشان تظهر النقاط."
+    )
 
 # نبني الخريطة بدون طبقة تايل افتراضية، ونضيف طبقتين يدويًا (شارع + قمر صناعي)
 # عشان يقدر المستخدم يبدل بينهم من أداة الطبقات (أيقونة أعلى يمين الخريطة)
