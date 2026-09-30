@@ -157,13 +157,73 @@ def load_points_in_bounds(south, west, north, east, limit=300):
     return _fetch_df(sql, params)
 
 
+ALL_COLUMNS_LABEL = "🔎 كل الأعمدة"
+TEXT_TYPES = {"text", "character varying", "character", "citext", "name"}
+DEFAULT_LAT, DEFAULT_LNG = 24.7136, 46.6753
+
+
+@st.cache_data(ttl=300)
+def get_table_columns():
+    """يقرأ هيكل الجدول الفعلي (أسماء الأعمدة وأنواعها) من قاعدة البيانات نفسها،
+    عشان أي عمود تضيفه للجدول مستقبلًا يظهر تلقائيًا بالتعديل والبحث بدون تعديل الكود."""
+    try:
+        return _fetch_df(
+            """
+            SELECT column_name, data_type, is_generated, identity_generation
+            FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = :t
+            ORDER BY ordinal_position
+            """,
+            {"t": TABLE_NAME},
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_columns_info():
+    """قائمة بكل أعمدة الجدول: الاسم، النوع، هل قابل للتعديل، هل قابل للبحث."""
+    df = get_table_columns()
+    if df.empty:  # احتياط لو تعذر قراءة هيكل الجدول
+        return [
+            {"name": c, "type": "text", "editable": c != PK_COLUMN, "searchable": True}
+            for c in [PK_COLUMN] + FORM_COLUMNS
+        ]
+    infos = []
+    for _, r in df.iterrows():
+        name, dtype = r["column_name"], r["data_type"]
+        is_geom = dtype == "USER-DEFINED" or name == GEOM_COLUMN
+        read_only = (
+            name == PK_COLUMN or is_geom or dtype == "ARRAY"
+            or r["is_generated"] == "ALWAYS" or r["identity_generation"] == "ALWAYS"
+        )
+        infos.append({
+            "name": name, "type": dtype,
+            "editable": not read_only, "searchable": not is_geom,
+        })
+    return infos
+
+
+def _to_text(v):
+    if v is None or (isinstance(v, float) and v != v):
+        return ""
+    return str(v)
+
+
 @st.cache_data(ttl=30)
-def search_points(query_text, limit=30):
-    """يدور على نص معين بأي عمود من أعمدة النموذج (بحث جزئي غير حساس لحالة الأحرف)."""
+def search_points(query_text, column, limit=50):
+    """بحث جزئي (غير حساس لحالة الأحرف) داخل عمود محدد، أو داخل كل الأعمدة."""
     if not query_text or not query_text.strip():
         return pd.DataFrame()
-    like_conditions = " OR ".join([f'"{col}"::text ILIKE :q' for col in FORM_COLUMNS])
-    cols = ", ".join([PK_COLUMN] + FORM_COLUMNS)
+    searchable = [c["name"] for c in get_columns_info() if c["searchable"]]
+    if column == ALL_COLUMNS_LABEL:
+        targets = searchable
+    elif column in searchable:  # نتأكد إن اسم العمود من أعمدة الجدول الفعلية (حماية)
+        targets = [column]
+    else:
+        raise ValueError("عمود البحث غير موجود بالجدول")
+    like_conditions = " OR ".join([f'"{c}"::text ILIKE :q' for c in targets])
+    extra = [column] if column in searchable else []
+    cols = ", ".join(f'"{c}"' for c in dict.fromkeys([PK_COLUMN] + FORM_COLUMNS + extra))
     sql = f"""
         SELECT {cols},
                ST_Y(ST_Transform({GEOM_COLUMN}, {INPUT_SRID})) AS map_lat,
@@ -172,8 +232,46 @@ def search_points(query_text, limit=30):
         WHERE {GEOM_COLUMN} IS NOT NULL AND ({like_conditions})
         LIMIT :limit
     """
-    params = {"q": f"%{query_text.strip()}%", "limit": limit}
-    return _fetch_df(sql, params)
+    return _fetch_df(sql, {"q": f"%{query_text.strip()}%", "limit": limit})
+
+
+def get_point_full(pk_value):
+    """يجيب كل الحقول القابلة للتعديل لنقطة واحدة + إحداثياتها (WGS84)."""
+    editable = [c["name"] for c in get_columns_info() if c["editable"]]
+    col_sql = ", ".join(f'"{c}"' for c in editable)
+    sql = f"""
+        SELECT {col_sql},
+               ST_Y(ST_Transform("{GEOM_COLUMN}", {INPUT_SRID})) AS "__lat",
+               ST_X(ST_Transform("{GEOM_COLUMN}", {INPUT_SRID})) AS "__lng"
+        FROM {TABLE_NAME} WHERE "{PK_COLUMN}" = :pk_value
+    """
+    engine = get_engine()
+    with engine.connect() as conn:
+        row = conn.execute(text(sql), {"pk_value": pk_value}).mappings().first()
+    return dict(row) if row else None
+
+
+def update_point_full(pk_value, changes: dict, col_types: dict, new_coords=None):
+    """يحدّث الحقول المتغيرة فقط + (اختياريًا) موقع النقطة.
+    القيمة None تعني NULL. الأنواع غير النصية تُحوَّل بـ CAST حسب نوع العمود بالقاعدة."""
+    sets, params = [], {"pk_value": pk_value}
+    for i, (col, val) in enumerate(changes.items()):
+        if val is None:
+            sets.append(f'"{col}" = NULL')
+        elif col_types.get(col, "text") in TEXT_TYPES:
+            sets.append(f'"{col}" = :v{i}')
+            params[f"v{i}"] = val
+        else:
+            sets.append(f'"{col}" = CAST(:v{i} AS {col_types[col]})')
+            params[f"v{i}"] = val
+    if new_coords:
+        sets.append(
+            f'"{GEOM_COLUMN}" = ST_Transform(ST_SetSRID(ST_MakePoint(:new_lng, :new_lat), {INPUT_SRID}), {TABLE_SRID})'
+        )
+        params["new_lat"], params["new_lng"] = new_coords
+    if not sets:
+        return
+    _execute(f'UPDATE {TABLE_NAME} SET {", ".join(sets)} WHERE "{PK_COLUMN}" = :pk_value', params)
 
 
 def insert_point(lat, lng, values: dict):
@@ -293,6 +391,73 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+# ---------------------------------------------------------
+# تنسيق التطبيق: واجهة عربية من اليمين لليسار (RTL) + خط عربي + مظهر أنظف
+# (الخريطة والأكواد والأرقام تبقى LTR لأن هذا هو الأنسب لها)
+# ---------------------------------------------------------
+st.markdown("""
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700&display=swap');
+
+        /* اتجاه الصفحة كاملة من اليمين لليسار */
+        html, body, .stApp,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"],
+        [data-testid="stMainBlockContainer"] {
+            direction: rtl;
+            text-align: right;
+        }
+
+        /* الخط العربي (ما نطبقه على span عشان ما نكسر أيقونات Streamlit) */
+        .stApp, .stApp p, .stApp label, .stApp li, .stApp input, .stApp textarea,
+        .stApp button, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5,
+        .stApp [data-baseweb="tab"], .stApp [data-baseweb="select"] div,
+        .stApp [data-testid="stCaptionContainer"] {
+            font-family: 'Cairo', 'Segoe UI', Tahoma, sans-serif !important;
+        }
+
+        h1, h2, h3, h4, h5, p, label,
+        [data-testid="stMarkdownContainer"],
+        [data-testid="stCaptionContainer"],
+        [data-testid="stWidgetLabel"] {
+            text-align: right !important;
+        }
+
+        /* حقول الإدخال */
+        input, textarea { direction: rtl; text-align: right; }
+        [data-testid="stNumberInput"] input { direction: ltr; text-align: left; }
+        [data-baseweb="select"] { direction: rtl; text-align: right; }
+
+        /* عناصر لازم تبقى LTR: الخريطة، الأكواد، محرر SQL، الجداول */
+        pre, code, [data-testid="stCode"], textarea[aria-label="SQL:"],
+        [data-testid="stCustomComponentV1"], iframe,
+        [data-testid="stDataFrame"] {
+            direction: ltr !important;
+            text-align: left !important;
+        }
+
+        /* مظهر عام */
+        .block-container { padding-top: 2rem; max-width: 1400px; }
+        h1 { color: #0b5cad; font-weight: 700; }
+        h2, h3, h4 { color: #1f3a5f; font-weight: 600; }
+
+        [data-baseweb="tab-list"] { gap: 6px; border-bottom: 2px solid #e3e8ef; }
+        [data-baseweb="tab"] {
+            border-radius: 10px 10px 0 0; padding: 10px 16px; font-weight: 600;
+        }
+
+        .stButton > button, .stFormSubmitButton > button, .stDownloadButton > button {
+            border-radius: 10px; font-weight: 600;
+        }
+        [data-testid="stForm"] {
+            border: 1px solid #e3e8ef; border-radius: 14px; padding: 1.2rem;
+            background: rgba(120, 140, 170, 0.05);
+        }
+        [data-testid="stAlert"] { border-radius: 12px; }
+        [data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; }
+    </style>
+""", unsafe_allow_html=True)
+
 st.title("🗺️ إدارة نقاط الخريطة - Point Manager")
 
 # =========================================================
@@ -305,46 +470,77 @@ st.subheader("🗺️ خريطة النقاط")
 st.caption("حرّك/كبّر الخريطة عشان تشوف النقاط بمنطقتك، ابحث عن نقطة محددة، أو اضغط على أيقونة الماركر 📍 بأعلى يسار الخريطة ثم حدد مكان النقطة الجديدة. تقدر تبدّل بين خريطة الشوارع والصورة الجوية من أيقونة الطبقات بأعلى يمين الخريطة.")
 
 # ---------------------------------------------------------
-# مربع البحث
+# مربع البحث: أولًا نختار اسم العمود، وبعدين نكتب الكلمة اللي نبحث عنها فيه
 # ---------------------------------------------------------
-search_col1, search_col2 = st.columns([4, 1])
-with search_col1:
-    search_query = st.text_input(
-        "🔍 ابحث عن نقطة (بالاسم، الرقم الموحد، الحي...)",
-        key="search_box",
-        placeholder="مثال: شارع الملك فهد",
-    )
-with search_col2:
-    st.write("")  # محاذاة
-    do_search = st.button("بحث", use_container_width=True)
+search_column_options = [ALL_COLUMNS_LABEL] + [c["name"] for c in get_columns_info() if c["searchable"]]
 
-search_results = pd.DataFrame()
-if do_search and search_query:
-    try:
-        search_results = search_points(search_query)
-        if search_results.empty:
-            st.warning("ما فيه نتائج مطابقة")
-        else:
-            st.success(f"لقيت {len(search_results)} نتيجة")
-    except Exception as e:
-        st.error(f"خطأ بالبحث: {e}")
+with st.form("search_form"):
+    sc_col, sc_query, sc_btn = st.columns([2, 3, 1])
+    with sc_col:
+        search_column = st.selectbox("📂 اختر العمود", search_column_options, key="search_column")
+    with sc_query:
+        search_query = st.text_input(
+            "🔍 الكلمة المراد البحث عنها",
+            key="search_box",
+            placeholder="مثال: شارع الملك فهد",
+        )
+    with sc_btn:
+        st.markdown("<div style='height:1.85rem'></div>", unsafe_allow_html=True)  # محاذاة الزر
+        do_search = st.form_submit_button("🔍 بحث", use_container_width=True, type="primary")
 
-# لو فيه نتيجة بحث، خلي المستخدم يختار وحدة يتوسط عليها الخريطة
-if not search_results.empty:
-    result_labels = {
-        idx: " - ".join(str(row[c]) for c in FORM_COLUMNS if pd.notna(row[c]) and row[c] != "") or f"نقطة {row[PK_COLUMN]}"
-        for idx, row in search_results.iterrows()
-    }
-    selected_idx = st.selectbox(
-        "اختر نتيجة للتوسط عليها بالخريطة:",
-        options=list(result_labels.keys()),
-        format_func=lambda i: result_labels[i],
-        key="search_result_select",
-    )
-    selected_row = search_results.loc[selected_idx]
-    st.session_state["focus_location"] = {
-        "lat": selected_row["map_lat"], "lng": selected_row["map_lng"]
-    }
+if do_search:
+    if not search_query.strip():
+        st.warning("اكتب الكلمة اللي تبي تبحث عنها")
+    else:
+        try:
+            st.session_state["search_results"] = search_points(search_query, search_column)
+            st.session_state["search_meta"] = {"column": search_column, "query": search_query.strip()}
+            st.session_state["search_seq"] = st.session_state.get("search_seq", 0) + 1
+            st.session_state.pop("focus_location", None)
+            st.session_state.pop("_focus_token", None)
+        except Exception as e:
+            st.error(f"خطأ بالبحث: {e}")
+
+search_results = st.session_state.get("search_results")
+if search_results is not None:
+    meta = st.session_state.get("search_meta", {})
+    if search_results.empty:
+        st.warning(f"ما فيه نتائج لكلمة «{meta.get('query', '')}» في {meta.get('column', '')}")
+    else:
+        head_col, clear_col = st.columns([4, 1])
+        with head_col:
+            st.success(f"لقيت {len(search_results)} نتيجة لكلمة «{meta['query']}» في: {meta['column']}")
+        with clear_col:
+            if st.button("🧹 مسح النتائج", use_container_width=True):
+                for k in ("search_results", "search_meta", "focus_location", "_focus_token"):
+                    st.session_state.pop(k, None)
+                st.rerun()
+
+        shown_extra = meta["column"] if meta["column"] in search_results.columns else None
+
+        def _result_label(row):
+            parts = [str(row[c]) for c in FORM_COLUMNS[:3] if pd.notna(row[c]) and row[c] != ""]
+            if shown_extra and shown_extra not in FORM_COLUMNS[:3] and pd.notna(row[shown_extra]):
+                parts.append(f"{shown_extra}: {row[shown_extra]}")
+            label = f"[{row[PK_COLUMN]}] " + (" - ".join(parts) if parts else "بدون بيانات")
+            return label if len(label) <= 130 else label[:127] + "..."
+
+        result_labels = {idx: _result_label(row) for idx, row in search_results.iterrows()}
+        seq = st.session_state.get("search_seq", 0)
+        selected_idx = st.selectbox(
+            "اختر نتيجة للتوسط عليها بالخريطة:",
+            options=list(result_labels.keys()),
+            format_func=lambda i: result_labels[i],
+            key=f"search_result_select_{seq}",
+        )
+        # نحدّث موقع التركيز فقط لما يتغير الاختيار فعليًا (عشان ما يتعارض مع زر «إظهار النقاط»)
+        token = (seq, selected_idx)
+        if st.session_state.get("_focus_token") != token:
+            selected_row = search_results.loc[selected_idx]
+            st.session_state["focus_location"] = {
+                "lat": selected_row["map_lat"], "lng": selected_row["map_lng"]
+            }
+            st.session_state["_focus_token"] = token
 
 # ---------------------------------------------------------
 # تنبيه بارز أعلى الخريطة لو فيه نقطة جديدة لسا ما انحفظت
@@ -969,8 +1165,12 @@ with tab_add:
 
 # ---------------- تبويب التعديل ----------------
 with tab_edit:
-    st.subheader("تعديل نقطة (من كامل الجدول)")
-    st.caption(f"أدخل رقم {PK_COLUMN} للنقطة اللي تبي تعدلها - يشتغل مع أي نقطة بالجدول، مو بس آخر 200.")
+    st.subheader("✏️ تعديل نقطة (من كامل الجدول)")
+    st.caption(f"أدخل رقم {PK_COLUMN} للنقطة اللي تبي تعدلها - يشتغل مع أي نقطة بالجدول، وتظهر لك كل حقول الجدول للتعديل + الموقع (الإحداثيات).")
+
+    flash_msg = st.session_state.pop("edit_flash", None)
+    if flash_msg:
+        st.success(flash_msg)
 
     id_col, btn_col = st.columns([2, 1])
     with id_col:
@@ -988,13 +1188,15 @@ with tab_edit:
             st.session_state.pop("edit_loaded_row", None)
         else:
             try:
-                result = get_point_by_id(selected_id)
-                if result.empty:
+                result = get_point_full(int(selected_id))
+                if result is None:
                     st.error(f"❌ ما فيه نقطة بالرقم {selected_id}")
                     st.session_state.pop("edit_loaded_row", None)
                 else:
-                    st.session_state["edit_loaded_row"] = result.iloc[0].to_dict()
+                    st.session_state["edit_loaded_row"] = result
                     st.session_state["edit_loaded_id"] = int(selected_id)
+                    # رقم إصدار يتغير مع كل تحميل عشان مفاتيح الحقول تتجدد ولا تحتفظ بقيم قديمة
+                    st.session_state["edit_ver"] = st.session_state.get("edit_ver", 0) + 1
             except Exception as e:
                 st.error(f"❌ خطأ: {e}")
                 st.session_state.pop("edit_loaded_row", None)
@@ -1003,29 +1205,132 @@ with tab_edit:
     if st.session_state.get("edit_loaded_row") and st.session_state.get("edit_loaded_id") == int(selected_id):
         row = st.session_state["edit_loaded_row"]
         loaded_id = st.session_state["edit_loaded_id"]
+        ver = st.session_state.get("edit_ver", 0)
+        kp = f"edit_{loaded_id}_{ver}"  # بادئة مفاتيح الحقول
 
-        st.info(f"📝 البيانات الحالية للنقطة رقم {loaded_id} - عدّل الحقل اللي تبيه بس واترك الباقي كما هو")
+        editable_cols = [c for c in get_columns_info() if c["editable"]]
+        col_types = {c["name"]: c["type"] for c in editable_cols}
 
-        # مهم: نربط مفتاح كل حقل برقم النقطة نفسها (loaded_id)، مو بس باسم العمود.
-        # لو المفتاح ثابت بين كل النقاط، Streamlit يحتفظ بالقيمة القديمة اللي كتبتها
-        # لنقطة سابقة وما يحدّثها للنقطة الجديدة المختارة.
-        with st.form(f"edit_form_{loaded_id}"):
+        st.info(f"📝 بيانات النقطة رقم {loaded_id} - عدّل أي حقل تبيه، والحقول اللي ما تغيّرها تبقى كما هي")
+
+        # ---------- 1) الموقع (الإحداثيات) ----------
+        st.markdown("#### 📍 الموقع (الإحداثيات)")
+        has_geom = row.get("__lat") is not None and row.get("__lng") is not None
+        orig_lat = float(row["__lat"]) if has_geom else DEFAULT_LAT
+        orig_lng = float(row["__lng"]) if has_geom else DEFAULT_LNG
+
+        set_geom = False
+        if not has_geom:
+            st.warning("⚠️ هذي النقطة ما لها موقع مسجّل. فعّل الخيار تحت لو تبي تحدد لها موقع.")
+            set_geom = st.checkbox("تحديد موقع لهذه النقطة", key=f"{kp}_setgeom")
+
+        lat_c, lng_c = st.columns(2)
+        with lat_c:
+            new_lat = st.number_input(
+                "خط العرض (Latitude)", value=orig_lat, format="%.6f", step=0.0001,
+                min_value=-90.0, max_value=90.0, key=f"{kp}_lat",
+            )
+        with lng_c:
+            new_lng = st.number_input(
+                "خط الطول (Longitude)", value=orig_lng, format="%.6f", step=0.0001,
+                min_value=-180.0, max_value=180.0, key=f"{kp}_lng",
+            )
+
+        coords_changed = (
+            (has_geom and (abs(new_lat - orig_lat) > 5e-7 or abs(new_lng - orig_lng) > 5e-7))
+            or (not has_geom and set_geom)
+        )
+
+        sync_latlong = False
+        if "lat" in col_types and "long" in col_types:
+            sync_latlong = st.checkbox(
+                "تحديث عمودي lat و long تلقائيًا لو تغيّر الموقع", value=True, key=f"{kp}_sync",
+            )
+
+        # معاينة الموقع على خريطة صغيرة (الأزرق = الحالي المسجّل، الأحمر = الجديد)
+        preview = folium.Map(location=[new_lat, new_lng], zoom_start=17, prefer_canvas=True, tiles=None)
+        folium.TileLayer("OpenStreetMap", name="🗺️ شوارع", overlay=False).add_to(preview)
+        folium.TileLayer(
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            attr="Esri World Imagery", name="🛰️ صورة جوية", overlay=False,
+        ).add_to(preview)
+        if has_geom:
+            folium.CircleMarker(
+                [orig_lat, orig_lng], radius=8, color="#1a73e8", fill=True,
+                fill_opacity=0.9, tooltip="الموقع الحالي المسجّل",
+            ).add_to(preview)
+        if coords_changed:
+            folium.Marker(
+                [new_lat, new_lng], tooltip="الموقع الجديد",
+                icon=folium.Icon(color="red", icon="map-marker", prefix="fa"),
+            ).add_to(preview)
+        folium.LayerControl(position="topright").add_to(preview)
+        st_folium(preview, width="100%", height=300, returned_objects=[], key=f"{kp}_preview")
+
+        if coords_changed:
+            st.caption("🔴 تم تغيير الموقع - سيتم حفظه عند الضغط على «حفظ التعديلات».")
+        else:
+            st.caption("🔵 الموقع الحالي المسجّل. غيّر الإحداثيات فوق لو تبي تصحح الموقع.")
+
+        # ---------- 2) كل حقول الجدول ----------
+        # مهم: مفتاح كل حقل مربوط برقم النقطة ورقم الإصدار، عشان ما تظهر قيم نقطة سابقة.
+        with st.form(f"edit_form_{loaded_id}_{ver}"):
+            st.markdown("#### 🗂️ بيانات النقطة (كل حقول الجدول)")
             edit_values = {}
-            for col in FORM_COLUMNS:
-                current_val = row.get(col) if pd.notna(row.get(col)) else ""
-                edit_values[col] = render_field_input(
-                    col, str(current_val), key=f"edit_{loaded_id}_{col}"
+
+            short_cols, long_cols = [], []
+            for c in editable_cols:
+                val = _to_text(row.get(c["name"]))
+                if c["name"] in LONG_TEXT_COLUMNS or len(val) > 80 or "\n" in val:
+                    long_cols.append(c)
+                else:
+                    short_cols.append(c)
+
+            grid = st.columns(2)
+            for i, c in enumerate(short_cols):
+                with grid[i % 2]:
+                    edit_values[c["name"]] = st.text_input(
+                        c["name"], value=_to_text(row.get(c["name"])),
+                        key=f"{kp}_{c['name']}", help=f"نوع الحقل: {c['type']}",
+                    )
+            for c in long_cols:
+                edit_values[c["name"]] = st.text_area(
+                    c["name"], value=_to_text(row.get(c["name"])),
+                    key=f"{kp}_{c['name']}", height=110, help=f"نوع الحقل: {c['type']}",
                 )
 
             update_submitted = st.form_submit_button("💾 حفظ التعديلات", type="primary")
-            if update_submitted:
+
+        if update_submitted:
+            # نرسل للقاعدة الحقول اللي تغيّرت فقط (أسلم وأسرع)
+            changes = {}
+            for name, new_val in edit_values.items():
+                if new_val != _to_text(row.get(name)):
+                    changes[name] = new_val if new_val.strip() != "" else None
+
+            if coords_changed and sync_latlong:
+                changes.setdefault("lat", f"{new_lat:.6f}")
+                changes.setdefault("long", f"{new_lng:.6f}")
+
+            if not changes and not coords_changed:
+                st.info("ما فيه أي تغييرات للحفظ")
+            else:
                 try:
-                    update_point(loaded_id, edit_values)
-                    st.success("✅ تم التعديل بنجاح")
+                    update_point_full(
+                        loaded_id, changes, col_types,
+                        new_coords=(new_lat, new_lng) if coords_changed else None,
+                    )
                     load_map_data.clear()
                     load_points_in_bounds.clear()
                     search_points.clear()
-                    st.session_state.pop("edit_loaded_row", None)
+                    st.session_state["edit_loaded_row"] = get_point_full(loaded_id)
+                    st.session_state["edit_ver"] = ver + 1
+                    parts = []
+                    if changes:
+                        parts.append(f"{len(changes)} حقل")
+                    if coords_changed:
+                        parts.append("الموقع")
+                    st.session_state["edit_flash"] = f"✅ تم حفظ التعديلات بنجاح ({' + '.join(parts)})"
                     st.rerun()
                 except Exception as e:
                     st.error(f"❌ فشل التعديل: {e}")
