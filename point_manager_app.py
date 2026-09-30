@@ -274,6 +274,11 @@ def update_point_full(pk_value, changes: dict, col_types: dict, new_coords=None)
     _execute(f'UPDATE {TABLE_NAME} SET {", ".join(sets)} WHERE "{PK_COLUMN}" = :pk_value', params)
 
 
+@st.cache_data(ttl=60)
+def get_total_count():
+    return int(_fetch_df(f"SELECT COUNT(*) AS n FROM {TABLE_NAME}").iloc[0]["n"])
+
+
 def insert_point(lat, lng, values: dict):
     cols = [GEOM_COLUMN] + list(values.keys())
     col_list = ", ".join(f'"{c}"' for c in cols)
@@ -392,73 +397,100 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------
-# تنسيق التطبيق: واجهة عربية من اليمين لليسار (RTL) + خط عربي + مظهر أنظف
-# (الخريطة والأكواد والأرقام تبقى LTR لأن هذا هو الأنسب لها)
+# تنسيق التطبيق: واجهة عربية RTL + خط Cairo + هوية بصرية موحدة
+# (الخريطة والأكواد والجداول تبقى LTR لأنها الأنسب لها)
 # ---------------------------------------------------------
 st.markdown("""
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap');
+        :root { --brand:#0b6bcb; --brand-dark:#084c91; --ink:#1b2a3b; --line:#e3e8ef; --soft:#f4f7fb; }
 
-        /* اتجاه الصفحة كاملة من اليمين لليسار */
-        html, body, .stApp,
-        [data-testid="stAppViewContainer"],
-        [data-testid="stMain"],
-        [data-testid="stMainBlockContainer"] {
-            direction: rtl;
-            text-align: right;
-        }
+        html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"],
+        [data-testid="stMainBlockContainer"] { direction: rtl; text-align: right; }
+        .stApp { background: var(--soft); }
 
-        /* الخط العربي (ما نطبقه على span عشان ما نكسر أيقونات Streamlit) */
-        .stApp, .stApp p, .stApp label, .stApp li, .stApp input, .stApp textarea,
-        .stApp button, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5,
-        .stApp [data-baseweb="tab"], .stApp [data-baseweb="select"] div,
-        .stApp [data-testid="stCaptionContainer"] {
+        .stApp, .stApp p, .stApp label, .stApp li, .stApp input, .stApp textarea, .stApp button,
+        .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp [data-baseweb="tab"],
+        .stApp [data-baseweb="select"] div, .stApp [data-testid="stCaptionContainer"],
+        .stApp [data-testid="stMetricValue"], .stApp [data-testid="stMetricLabel"] {
             font-family: 'Cairo', 'Segoe UI', Tahoma, sans-serif !important;
         }
+        h1, h2, h3, h4, h5, p, label, [data-testid="stMarkdownContainer"],
+        [data-testid="stCaptionContainer"], [data-testid="stWidgetLabel"] { text-align: right !important; }
 
-        h1, h2, h3, h4, h5, p, label,
-        [data-testid="stMarkdownContainer"],
-        [data-testid="stCaptionContainer"],
-        [data-testid="stWidgetLabel"] {
-            text-align: right !important;
-        }
-
-        /* حقول الإدخال */
         input, textarea { direction: rtl; text-align: right; }
         [data-testid="stNumberInput"] input { direction: ltr; text-align: left; }
         [data-baseweb="select"] { direction: rtl; text-align: right; }
-
-        /* عناصر لازم تبقى LTR: الخريطة، الأكواد، محرر SQL، الجداول */
         pre, code, [data-testid="stCode"], textarea[aria-label="SQL:"],
-        [data-testid="stCustomComponentV1"], iframe,
-        [data-testid="stDataFrame"] {
-            direction: ltr !important;
-            text-align: left !important;
+        [data-testid="stCustomComponentV1"], iframe, [data-testid="stDataFrame"] {
+            direction: ltr !important; text-align: left !important;
         }
 
-        /* مظهر عام */
-        .block-container { padding-top: 2rem; max-width: 1400px; }
-        h1 { color: #0b5cad; font-weight: 700; }
-        h2, h3, h4 { color: #1f3a5f; font-weight: 600; }
+        .block-container { padding-top: 1.5rem; max-width: 1400px; }
+        h2, h3, h4 { color: var(--ink); font-weight: 700; }
+        h3 { border-right: 5px solid var(--brand); padding-right: 10px; margin-top: .6rem; }
 
-        [data-baseweb="tab-list"] { gap: 6px; border-bottom: 2px solid #e3e8ef; }
-        [data-baseweb="tab"] {
-            border-radius: 10px 10px 0 0; padding: 10px 16px; font-weight: 600;
+        /* ---- الترويسة ---- */
+        .hero {
+            background: linear-gradient(135deg, #084c91 0%, #0b6bcb 55%, #2fa0e0 100%);
+            border-radius: 20px; padding: 26px 30px; margin-bottom: 18px; color: #fff;
+            box-shadow: 0 8px 24px rgba(11,107,203,.25);
         }
+        .hero-title { font-size: 2rem; font-weight: 800; line-height: 1.3; }
+        .hero-sub { opacity: .92; font-size: 1.02rem; margin-top: 4px; }
 
+        /* ---- بطاقات الإحصائيات ---- */
+        [data-testid="stMetric"] {
+            background: #fff; border: 1px solid var(--line); border-radius: 16px;
+            padding: 14px 20px; box-shadow: 0 2px 8px rgba(20,40,80,.05);
+        }
+        [data-testid="stMetricValue"] { color: var(--brand); font-weight: 800; }
+        [data-testid="stMetricLabel"] p { color: #5b6b80; font-weight: 600; }
+
+        /* ---- التبويبات على شكل أقراص ---- */
+        [data-baseweb="tab-list"] {
+            gap: 6px; background: #fff; padding: 6px; border-radius: 14px;
+            border: 1px solid var(--line); flex-wrap: wrap;
+        }
+        [data-baseweb="tab"] { border-radius: 10px; padding: 8px 16px; height: auto; }
+        [data-baseweb="tab"][aria-selected="true"] { background: var(--brand) !important; }
+        [data-baseweb="tab"][aria-selected="true"] p { color: #fff !important; }
+        [data-baseweb="tab-highlight"], [data-baseweb="tab-border"] { display: none; }
+
+        /* ---- الأزرار والنماذج والتنبيهات ---- */
         .stButton > button, .stFormSubmitButton > button, .stDownloadButton > button {
-            border-radius: 10px; font-weight: 600;
+            border-radius: 12px; font-weight: 700; padding: .5rem 1rem; transition: all .15s;
         }
-        [data-testid="stForm"] {
-            border: 1px solid #e3e8ef; border-radius: 14px; padding: 1.2rem;
-            background: rgba(120, 140, 170, 0.05);
+        .stButton > button:hover, .stFormSubmitButton > button:hover { transform: translateY(-1px); }
+        button[kind="primary"], button[kind="primaryFormSubmit"] {
+            background: var(--brand); border-color: var(--brand);
         }
-        [data-testid="stAlert"] { border-radius: 12px; }
-        [data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; }
+        button[kind="primary"]:hover, button[kind="primaryFormSubmit"]:hover { background: var(--brand-dark); }
+        .st-key-delete_final_btn button:not(:disabled) { background: #d32f2f; border-color: #d32f2f; color: #fff; }
+        [data-testid="stForm"], [data-testid="stExpander"] {
+            background: #fff; border: 1px solid var(--line); border-radius: 16px; padding: 1.1rem;
+            box-shadow: 0 2px 8px rgba(20,40,80,.04);
+        }
+        [data-testid="stAlert"] { border-radius: 14px; }
+        [data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+        hr { border-color: var(--line); }
+
+        /* ---- إخفاء شريط أدوات Streamlit ---- */
+        header[data-testid="stHeader"], [data-testid="stToolbar"], [data-testid="stDecoration"],
+        #MainMenu, footer { display: none !important; }
+
+        @keyframes pulse-ring {
+            0% { transform: scale(.6); opacity: .6; } 70%, 100% { transform: scale(1.8); opacity: 0; }
+        }
     </style>
+    <div class="hero">
+        <div class="hero-title">🗺️ إدارة نقاط التجمعات</div>
+        <div class="hero-sub">ابحث، أضف، عدّل واحذف النقاط على خريطة تفاعلية — Point Manager</div>
+    </div>
 """, unsafe_allow_html=True)
 
-st.title("🗺️ إدارة نقاط الخريطة - Point Manager")
+stats_ph = st.container()  # تُعبّأ لاحقًا بعد جلب بيانات الخريطة
+
 
 # =========================================================
 # الخريطة: توضع خارج st.tabs تمامًا (مهم جدًا)
@@ -466,12 +498,18 @@ st.title("🗺️ إدارة نقاط الخريطة - Point Manager")
 # حجمها صفر وتطلع بيضاء/فاضية حتى لو رجعت تفتح نفس التبويب.
 # لذلك نخليها دايمًا ظاهرة بأعلى الصفحة مباشرة.
 # =========================================================
-st.subheader("🗺️ خريطة النقاط")
-st.caption("حرّك/كبّر الخريطة عشان تشوف النقاط بمنطقتك، ابحث عن نقطة محددة، أو اضغط على أيقونة الماركر 📍 بأعلى يسار الخريطة ثم حدد مكان النقطة الجديدة. تقدر تبدّل بين خريطة الشوارع والصورة الجوية من أيقونة الطبقات بأعلى يمين الخريطة.")
+with st.expander("ℹ️ طريقة الاستخدام", expanded=False):
+    st.markdown("""
+- **البحث:** اختر العمود ثم اكتب الكلمة، واختر نتيجة لتتوسط الخريطة عليها.
+- **عرض النقاط:** كبّر/حرّك الخريطة لمنطقتك ثم اضغط «إظهار النقاط حسب العرض الحالي».
+- **إضافة نقطة:** اضغط أيقونة الماركر 📍 أعلى يسار الخريطة ثم حدد المكان، وعبّي البيانات واحفظ.
+- **الطبقات:** بدّل بين الشوارع والصورة الجوية من أيقونة الطبقات أعلى يمين الخريطة.
+""")
 
 # ---------------------------------------------------------
 # مربع البحث: أولًا نختار اسم العمود، وبعدين نكتب الكلمة اللي نبحث عنها فيه
 # ---------------------------------------------------------
+st.markdown("### 🔍 البحث عن نقطة")
 search_column_options = [ALL_COLUMNS_LABEL] + [c["name"] for c in get_columns_info() if c["searchable"]]
 
 with st.form("search_form"):
@@ -599,6 +637,16 @@ else:
         "ثم اضغط زر «👁️ إظهار النقاط حسب العرض الحالي فقط» تحت الخريطة عشان تظهر النقاط."
     )
 
+with stats_ph:
+    _m1, _m2, _m3 = st.columns(3)
+    try:
+        _total = f"{get_total_count():,}"
+    except Exception:
+        _total = "—"
+    _m1.metric("📌 إجمالي النقاط", _total)
+    _m2.metric("👁️ الظاهرة بالخريطة", f"{len(map_df):,}" if last_bounds else "—")
+    _m3.metric("🔴 نقطة غير محفوظة", "نعم" if st.session_state.get("new_point_location") else "لا")
+
 # نبني الخريطة بدون طبقة تايل افتراضية، ونضيف طبقتين يدويًا (شارع + قمر صناعي)
 # عشان يقدر المستخدم يبدل بينهم من أداة الطبقات (أيقونة أعلى يمين الخريطة)
 m = folium.Map(location=[center_lat, center_lng], zoom_start=zoom_level, prefer_canvas=True, tiles=None)
@@ -625,7 +673,7 @@ if not map_df.empty:
     def build_row(row):
         parts = [f"<b>{PK_COLUMN}:</b> {row[PK_COLUMN]}"]
         parts += [f"<b>{c}:</b> {row[c]}" for c in popup_cols if pd.notna(row[c]) and row[c] != ""]
-        popup_text = "<br>".join(parts)
+        popup_text = "<div dir='rtl' style='text-align:right;font-family:Cairo,Tahoma,sans-serif'>" + "<br>".join(parts) + "</div>"
         return [row["map_lat"], row["map_lng"], popup_text]
 
     cluster_data = [build_row(row) for _, row in map_df.iterrows()]
@@ -694,6 +742,7 @@ Draw(
 
 folium.LayerControl(position="topright", collapsed=False).add_to(m)
 
+st.markdown("### 🗺️ الخريطة")
 try:
     map_output = st_folium(
         m, width="100%", height=550,
@@ -717,9 +766,9 @@ if map_output and map_output.get("bounds"):
         "north": b["_northEast"]["lat"], "east": b["_northEast"]["lng"],
     }
 
-refresh_col1, refresh_col2 = st.columns([1, 4])
+refresh_col1, refresh_col2, _ = st.columns([2, 1, 2])
 with refresh_col1:
-    if st.button("👁️ إظهار النقاط حسب العرض الحالي فقط", use_container_width=True):
+    if st.button("👁️ إظهار النقاط حسب العرض الحالي", use_container_width=True, type="primary"):
         if st.session_state.get("pending_bounds"):
             pb = st.session_state["pending_bounds"]
             st.session_state["last_map_bounds"] = pb
@@ -730,6 +779,11 @@ with refresh_col1:
                 "lng": (pb["west"] + pb["east"]) / 2,
             }
         st.session_state.pop("focus_location", None)
+        st.rerun()
+
+with refresh_col2:
+    if st.button("🧽 إخفاء النقاط", use_container_width=True):
+        st.session_state.pop("last_map_bounds", None)
         st.rerun()
 
 # التقاط نقطة جديدة تمت إضافتها عن طريق أيقونة الماركر (Draw tool) بأعلى يسار الخريطة
@@ -790,7 +844,7 @@ st.divider()
 # باقي الوظائف تحت بالتبويبات (عرض / إضافة يدوي / تعديل / حذف)
 # =========================================================
 tab_view, tab_sql, tab_import, tab_add, tab_edit, tab_delete = st.tabs(
-    ["📋 عرض البيانات", "🧮 استعلام SQL", "📤 استيراد جماعي", "➕ إضافة نقطة (يدوي)", "✏️ تعديل نقطة", "🗑️ حذف نقطة"]
+    ["📋 البيانات", "🧮 استعلام SQL", "📤 استيراد", "➕ إضافة", "✏️ تعديل", "🗑️ حذف"]
 )
 
 # ---------------- تبويب العرض ----------------
@@ -804,6 +858,10 @@ with tab_view:
             column_config={
                 "رابط_الموقع": st.column_config.LinkColumn("رابط الموقع", display_text="📍 فتح بقوقل ماب")
             },
+        )
+        st.download_button(
+            "⬇️ تصدير CSV", data=df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="points_latest.csv", mime="text/csv",
         )
     except Exception as e:
         st.error(f"خطأ في جلب البيانات: {e}")
@@ -1377,7 +1435,7 @@ with tab_delete:
 
         confirm = st.checkbox("أنا متأكد إني أبي أحذف هذي النقاط", key="delete_confirm_checkbox")
 
-        if st.button("🗑️ تأكيد الحذف النهائي", type="primary", disabled=not confirm):
+        if st.button("🗑️ تأكيد الحذف النهائي", type="primary", disabled=not confirm, key="delete_final_btn"):
             try:
                 success_count, errors = delete_points(all_ids_to_delete)
                 st.success(f"✅ تم حذف {success_count} من {len(all_ids_to_delete)} نقطة بنجاح")
