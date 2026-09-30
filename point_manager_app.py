@@ -1228,12 +1228,12 @@ with tab_edit:
         with lat_c:
             new_lat = st.number_input(
                 "خط العرض (Latitude)", value=orig_lat, format="%.6f", step=0.0001,
-                min_value=-90.0, max_value=90.0, key=f"{kp}_lat",
+                min_value=-90.0, max_value=90.0, key=f"{kp}_coord_lat",
             )
         with lng_c:
             new_lng = st.number_input(
                 "خط الطول (Longitude)", value=orig_lng, format="%.6f", step=0.0001,
-                min_value=-180.0, max_value=180.0, key=f"{kp}_lng",
+                min_value=-180.0, max_value=180.0, key=f"{kp}_coord_lng",
             )
 
         coords_changed = (
@@ -1291,12 +1291,12 @@ with tab_edit:
                 with grid[i % 2]:
                     edit_values[c["name"]] = st.text_input(
                         c["name"], value=_to_text(row.get(c["name"])),
-                        key=f"{kp}_{c['name']}", help=f"نوع الحقل: {c['type']}",
+                        key=f"{kp}_field_{c['name']}", help=f"نوع الحقل: {c['type']}",
                     )
             for c in long_cols:
                 edit_values[c["name"]] = st.text_area(
                     c["name"], value=_to_text(row.get(c["name"])),
-                    key=f"{kp}_{c['name']}", height=110, help=f"نوع الحقل: {c['type']}",
+                    key=f"{kp}_field_{c['name']}", height=110, help=f"نوع الحقل: {c['type']}",
                 )
 
             update_submitted = st.form_submit_button("💾 حفظ التعديلات", type="primary")
