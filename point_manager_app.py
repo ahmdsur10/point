@@ -27,6 +27,9 @@ import folium
 from folium.plugins import FastMarkerCluster, Draw
 from streamlit_folium import st_folium
 from sqlalchemy import text, create_engine
+import streamlit.components.v1 as components
+
+import point_report as pr
 
 try:
     import shapefile  # مكتبة pyshp - قراءة شيب فايل بدون الحاجة لـ GDAL
@@ -843,8 +846,8 @@ st.divider()
 # =========================================================
 # باقي الوظائف تحت بالتبويبات (عرض / إضافة يدوي / تعديل / حذف)
 # =========================================================
-tab_view, tab_sql, tab_import, tab_add, tab_edit, tab_delete = st.tabs(
-    ["📋 البيانات", "🧮 استعلام SQL", "📤 استيراد", "➕ إضافة", "✏️ تعديل", "🗑️ حذف"]
+tab_view, tab_sql, tab_import, tab_add, tab_edit, tab_delete, tab_report = st.tabs(
+    ["📋 البيانات", "🧮 استعلام SQL", "📤 استيراد", "➕ إضافة", "✏️ تعديل", "🗑️ حذف", "📄 تقرير النقطة"]
 )
 
 # ---------------- تبويب العرض ----------------
@@ -1453,3 +1456,124 @@ with tab_delete:
                 st.error(f"❌ فشل الحذف: {e}")
     else:
         st.info("اختر أو اكتب رقم/أرقام النقاط اللي تبي تحذفها")
+
+
+# ---------------- تبويب تقرير النقطة ----------------
+@st.cache_data(show_spinner=False)
+def _read_network_cached(filename, data):
+    return pr.read_network_file(filename, data)
+
+
+with tab_report:
+    st.subheader("📄 تقرير النقطة + علاقتها بشبكة السيول")
+    st.caption("اختر النقطة، ارفع بيانات شبكة السيول (بأي صيغة)، وبيطلع لك تقرير فيه خريطة بالصورة الجوية وتحليل: النقطة على خط قائم؟ بجوار خط؟ أو مستقبلي؟")
+
+    # ---- 1) اختيار النقطة ----
+    st.markdown("#### 1️⃣ اختر النقطة")
+    rp_c1, rp_c2 = st.columns(2)
+    with rp_c1:
+        rp_id = st.number_input(f"رقم {PK_COLUMN}", min_value=0, step=1, value=0, key="rp_id")
+    with rp_c2:
+        sr = st.session_state.get("search_results")
+        rp_pick = None
+        if sr is not None and not sr.empty:
+            opts = {int(r[PK_COLUMN]): f"[{r[PK_COLUMN]}] " + " - ".join(str(r[c]) for c in FORM_COLUMNS[:2] if pd.notna(r[c]))
+                    for _, r in sr.iterrows()}
+            rp_pick = st.selectbox("أو اختر من نتائج البحث", [None] + list(opts.keys()),
+                                   format_func=lambda k: "—" if k is None else opts[k], key="rp_pick")
+    point_id = int(rp_pick) if rp_pick else int(rp_id)
+
+    # ---- 2) بيانات الشبكة ----
+    st.markdown("#### 2️⃣ بيانات شبكة السيول")
+    st.caption("الصيغ المدعومة: ZIP (شيب فايل) · GeoJSON · KML/KMZ · CSV/Excel (عمود WKT) · GPKG/GML/DXF (تحتاج geopandas). تقدر ترفع أكثر من ملف (مثلاً قائم + مستقبلي).")
+    net_files = st.file_uploader("ارفع ملف/ملفات الشبكة", type=pr.SUPPORTED_TYPES,
+                                 accept_multiple_files=True, key="rp_net_files")
+
+    status_choices = [pr.ST_EXISTING, pr.ST_UNDER, pr.ST_FUTURE, pr.ST_UNKNOWN, "حسب حقل داخل الملف"]
+    crs_choices = {"تلقائي (من الملف)": None, "WGS84 (4326)": 4326, "Ain el Abd UTM 38N (20438)": 20438,
+                   "Ain el Abd UTM 39N (20439)": 20439, "WGS84 UTM 38N (32638)": 32638,
+                   "WGS84 UTM 39N (32639)": 32639}
+    layer_cfgs, load_errors = [], []
+    for i, uf in enumerate(net_files or []):
+        try:
+            raw = _read_network_cached(uf.name, uf.getvalue())
+        except Exception as e:
+            load_errors.append(f"{uf.name}: {e}")
+            continue
+        with st.expander(f"🧱 {uf.name} — {len(raw['features'])} عنصر ({', '.join(f'{k}: {v}' for k, v in raw['geom_types'].items())})", expanded=True):
+            k1, k2, k3 = st.columns(3)
+            with k1:
+                lname = st.text_input("اسم الطبقة", value=uf.name.rsplit(".", 1)[0], key=f"rp_ln_{i}")
+            with k2:
+                stat_sel = st.selectbox("حالة عناصر الملف", status_choices, key=f"rp_st_{i}")
+            with k3:
+                crs_lbl = st.selectbox(
+                    "نظام الإحداثيات" + (f" (مكتشف: EPSG:{raw['crs'].to_epsg()})" if raw["crs"] is not None and raw["crs"].to_epsg() else ""),
+                    list(crs_choices.keys()), key=f"rp_crs_{i}")
+            st_field = None
+            if stat_sel == "حسب حقل داخل الملف":
+                if raw["fields"]:
+                    st_field = st.selectbox("الحقل اللي يحدد الحالة (قائم / مقترح / مستقبلي ...)", raw["fields"], key=f"rp_sf_{i}")
+                else:
+                    st.warning("الملف ما فيه حقول وصفية — اختر حالة ثابتة.")
+            crs_final = pr.CRS.from_epsg(crs_choices[crs_lbl]) if crs_choices[crs_lbl] else raw["crs"]
+            if crs_final is None:
+                st.error("❌ نظام الإحداثيات غير معروف لهذا الملف — اخترها من القائمة.")
+                continue
+            layer_cfgs.append(dict(name=lname, file=uf.name, raw=raw, crs=crs_final,
+                                   mode="field" if st_field else "fixed",
+                                   value=None if stat_sel == "حسب حقل داخل الملف" else stat_sel, field=st_field))
+    for e in load_errors:
+        st.error(f"❌ {e}")
+
+    # ---- 3) المعاملات ----
+    st.markdown("#### 3️⃣ معايير التحليل")
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        on_tol = st.number_input("«على الخط» إذا المسافة ≤ (م)", 0.5, 50.0, 3.0, 0.5, key="rp_on")
+    with p2:
+        near_tol = st.number_input("«بجوار الخط» إذا المسافة ≤ (م)", 1.0, 500.0, 25.0, 1.0, key="rp_near")
+    with p3:
+        search_r = st.number_input("نطاق البحث للجدول (م)", 50.0, 3000.0, 300.0, 50.0, key="rp_rad")
+    q1, q2 = st.columns(2)
+    with q1:
+        preparer = st.text_input("اسم المُعِدّ (اختياري)", key="rp_preparer")
+    with q2:
+        rp_notes = st.text_area("ملاحظات تظهر بالتقرير (اختياري)", height=68, key="rp_notes")
+
+    if st.button("📄 إنشاء التقرير", type="primary", key="rp_go"):
+        if point_id <= 0:
+            st.warning("⚠️ أدخل رقم نقطة صحيح")
+        else:
+            try:
+                row = get_point_full(point_id)
+                if row is None:
+                    st.error(f"❌ ما فيه نقطة بالرقم {point_id}")
+                elif row.get("__lat") is None:
+                    st.error("❌ هذي النقطة ما لها موقع مسجّل")
+                else:
+                    with st.spinner("جاري التحليل وبناء الخرائط..."):
+                        feats, infos = [], []
+                        for c in layer_cfgs:
+                            lf = pr.prepare_layer(c["name"], c["raw"], c["crs"], c["mode"], c["value"], c["field"], TABLE_SRID)
+                            feats += lf
+                            infos.append({"name": c["name"], "file": c["file"], "count": len(lf),
+                                          "status_desc": f"حقل «{c['field']}»" if c["mode"] == "field" else c["value"],
+                                          "epsg": c["crs"].to_epsg() or "مخصص"})
+                        an = pr.analyze_point(float(row["__lat"]), float(row["__lng"]), feats,
+                                              on_tol, max(near_tol, on_tol), search_r, TABLE_SRID)
+                        attrs = {k: v for k, v in row.items() if not str(k).startswith("__")}
+                        html_doc = pr.build_report_html(an, attrs, infos, point_id, LONG_TEXT_COLUMNS, preparer, rp_notes)
+                    st.session_state["rp_html"] = html_doc
+                    st.session_state["rp_meta"] = (point_id, an["headline"])
+            except Exception as e:
+                st.session_state.pop("rp_html", None)
+                st.error(f"❌ تعذر إنشاء التقرير: {e}")
+
+    if st.session_state.get("rp_html"):
+        pid, headline = st.session_state["rp_meta"]
+        st.success(f"✅ تقرير النقطة {pid}: {headline}")
+        st.download_button("⬇️ تنزيل التقرير (HTML — يفتح بأي متصفح ويُطبع PDF)",
+                           data=st.session_state["rp_html"].encode("utf-8"),
+                           file_name=f"point_{pid}_report.html", mime="text/html", key="rp_dl")
+        components.html(st.session_state["rp_html"], height=1100, scrolling=True)
