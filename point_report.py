@@ -490,15 +490,23 @@ def _parts(g):
         yield g
 
 
-def render_report(analysis, point_id, description, dpi=200):
+def render_report(analysis, point_id, description, dpi=200, view=None):
     """يرجع (png_bytes, pdf_bytes) لصفحة A4 فيها: العنوان، وصف الموقع، علاقة الشبكة، الخريطة بالصورة الجوية."""
     lat, lng = analysis["lat"], analysis["lng"]
     feats = analysis["features"]
     colors = case_colors(feats)
     near = analysis["nearest"]
-    radius = max(120.0, min((near or 0) * 1.3, 600.0), analysis["near_tol"] * 3)
+    if view:  # (south, west, north, east) من خريطة المعاينة: نفس المركز ونفس عرض الخريطة
+        vs, vw, vn, ve = view
+        clat, clng = (vs + vn) / 2, (vw + ve) / 2
+        radius = max(15.0, (ve - vw) * 111320 * math.cos(math.radians(clat)) / 2)
+    else:
+        clat, clng = lat, lng
+        radius = max(120.0, min((near or 0) * 1.3, 600.0), analysis["near_tol"] * 3)
     aspect = 7.3 / 6.6
-    bg, (ox, oy), z, mpp, tiles_ok = _aerial_background(lat, lng, radius, aspect)
+    bg, (ox, oy), z, mpp, tiles_ok = _aerial_background(clat, clng, radius, aspect)
+    dlat_v = radius * 2 / 111320.0
+    dlng_v = dlat_v / max(math.cos(math.radians(clat)), 0.2)
 
     plt.rcParams["font.family"] = "DejaVu Sans"
     fig = plt.figure(figsize=(8.27, 11.69), dpi=dpi, facecolor="white")
@@ -506,8 +514,7 @@ def render_report(analysis, point_id, description, dpi=200):
 
     # ---- الترويسة ----
     fig.add_artist(Rectangle((0, 0.925), 1, 0.075, transform=fig.transFigure, color="#0b4f9e"))
-    fig.text(0.95, 0.963, ar("تقرير نقطة التجمع"), color="white", fontsize=22, fontweight="bold", ha="right", va="center")
-    fig.text(0.05, 0.963, f"#{point_id}", color="white", fontsize=24, fontweight="bold", ha="left", va="center")
+    fig.text(0.5, 0.963, ar("تقرير نقطة التجمع"), color="white", fontsize=24, fontweight="bold", ha="center", va="center")
 
     # ---- وصف الموقع ----
     fig.text(0.95, 0.895, ar("وصف الموقع"), color="#0b4f9e", fontsize=13, fontweight="bold", ha="right", va="center")
@@ -548,9 +555,12 @@ def render_report(analysis, point_id, description, dpi=200):
         px, py = _merc(lon, la, z)
         return px - ox, py - oy
 
+    in_view = set()
     for f in feats:
-        if f["dist"] > radius * 2:
+        bx0, by0, bx1, by1 = f["geom_w"].bounds
+        if bx1 < clng - dlng_v or bx0 > clng + dlng_v or by1 < clat - dlat_v or by0 > clat + dlat_v:
             continue
+        in_view.add(f["case"])
         col = colors[f["case"]]
         for g in _parts(f["geom_w"]):
             t = g.geom_type
@@ -574,12 +584,13 @@ def render_report(analysis, point_id, description, dpi=200):
     ax.scatter([cx], [cy], s=140, color="#ff1744", edgecolor="white", linewidth=2.2, zorder=8)
 
     # مقياس الرسم
-    nice = next((v for v in (10, 20, 25, 50, 100, 200, 250, 500) if v / mpp > bg.width * 0.12), 500)
+    nice = next((v for v in (1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000) if v / mpp > bg.width * 0.12), 1000)
     bar = nice / mpp
     bx, by = bg.width * 0.04, bg.height * 0.95
-    ax.add_patch(Rectangle((bx - 6, by - 28), bar + 12, 40, color="white", alpha=0.75, zorder=9))
+    pad, bh = bg.width * 0.012, bg.height * 0.055
+    ax.add_patch(Rectangle((bx - pad, by - bh * 0.85), bar + 2 * pad, bh, color="white", alpha=0.78, zorder=9))
     ax.plot([bx, bx + bar], [by, by], color="black", lw=3, zorder=10)
-    ax.text(bx + bar / 2, by - 8, f"{nice} m", ha="center", va="bottom", fontsize=8, fontweight="bold", zorder=10)
+    ax.text(bx + bar / 2, by - bh * 0.15, f"{nice} m", ha="center", va="bottom", fontsize=8, fontweight="bold", zorder=10)
     # اتجاه الشمال
     ax.annotate("N", xy=(bg.width * 0.95, bg.height * 0.05), xytext=(bg.width * 0.95, bg.height * 0.15),
                 ha="center", va="center", fontsize=11, fontweight="bold", color="white",
@@ -588,7 +599,7 @@ def render_report(analysis, point_id, description, dpi=200):
     # مفتاح الخريطة: نقطة التجمع + الشبكة حسب case
     handles = [Line2D([0], [0], marker="o", color="none", markerfacecolor="#ff1744", markeredgecolor="white",
                       markersize=11, label=ar("نقطة التجمع"))]
-    present = sorted({f["case"] for f in feats if f["dist"] <= radius * 2}) or []
+    present = sorted(in_view)
     for c in present:
         handles.append(Line2D([0], [0], color=colors[c], lw=4, label=ar(f"شبكة سيول: {c}")))
     leg = ax.legend(handles=handles, loc="lower right", fontsize=9.5, framealpha=0.93, title=ar("مفتاح الخريطة"),
