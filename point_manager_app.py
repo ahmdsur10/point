@@ -1465,11 +1465,9 @@ def _read_network_cached(filename, data):
 
 
 with tab_report:
-    st.subheader("📄 تقرير النقطة + علاقتها بشبكة السيول")
-    st.caption("اختر النقطة، ارفع بيانات شبكة السيول (بأي صيغة)، وبيطلع لك تقرير فيه خريطة بالصورة الجوية وتحليل: النقطة على خط قائم؟ بجوار خط؟ أو مستقبلي؟")
+    st.subheader("📄 تقرير نقطة التجمع")
+    st.caption("اختر النقطة وارفع شبكة السيول (Shapefile ZIP أو GeoJSON)، وبيطلع تقرير بخريطة الصورة الجوية تقدر تحمله صورة أو PDF.")
 
-    # ---- 1) اختيار النقطة ----
-    st.markdown("#### 1️⃣ اختر النقطة")
     rp_c1, rp_c2 = st.columns(2)
     with rp_c1:
         rp_id = st.number_input(f"رقم {PK_COLUMN}", min_value=0, step=1, value=0, key="rp_id")
@@ -1483,63 +1481,37 @@ with tab_report:
                                    format_func=lambda k: "—" if k is None else opts[k], key="rp_pick")
     point_id = int(rp_pick) if rp_pick else int(rp_id)
 
-    # ---- 2) بيانات الشبكة ----
-    st.markdown("#### 2️⃣ بيانات شبكة السيول")
-    st.caption("الصيغ المدعومة: ZIP (شيب فايل) · GeoJSON · KML/KMZ · CSV/Excel (عمود WKT) · GPKG/GML/DXF (تحتاج geopandas). تقدر ترفع أكثر من ملف (مثلاً قائم + مستقبلي).")
-    net_files = st.file_uploader("ارفع ملف/ملفات الشبكة", type=pr.SUPPORTED_TYPES,
-                                 accept_multiple_files=True, key="rp_net_files")
+    net_file = st.file_uploader("ملف شبكة السيول (ZIP شيب فايل أو GeoJSON)", type=pr.SUPPORTED_TYPES, key="rp_net")
 
-    status_choices = [pr.ST_EXISTING, pr.ST_UNDER, pr.ST_FUTURE, pr.ST_UNKNOWN, "حسب حقل داخل الملف"]
-    crs_choices = {"تلقائي (من الملف)": None, "WGS84 (4326)": 4326, "Ain el Abd UTM 38N (20438)": 20438,
-                   "Ain el Abd UTM 39N (20439)": 20439, "WGS84 UTM 38N (32638)": 32638,
-                   "WGS84 UTM 39N (32639)": 32639}
-    layer_cfgs, load_errors = [], []
-    for i, uf in enumerate(net_files or []):
+    layer = None
+    if net_file:
         try:
-            raw = _read_network_cached(uf.name, uf.getvalue())
-        except Exception as e:
-            load_errors.append(f"{uf.name}: {e}")
-            continue
-        with st.expander(f"🧱 {uf.name} — {len(raw['features'])} عنصر ({', '.join(f'{k}: {v}' for k, v in raw['geom_types'].items())})", expanded=True):
-            k1, k2, k3 = st.columns(3)
+            raw = _read_network_cached(net_file.name, net_file.getvalue())
+            case_field = pr.find_case_field(raw["fields"])
+            k1, k2 = st.columns(2)
             with k1:
-                lname = st.text_input("اسم الطبقة", value=uf.name.rsplit(".", 1)[0], key=f"rp_ln_{i}")
-            with k2:
-                stat_sel = st.selectbox("حالة عناصر الملف", status_choices, key=f"rp_st_{i}")
-            with k3:
-                crs_lbl = st.selectbox(
-                    "نظام الإحداثيات" + (f" (مكتشف: EPSG:{raw['crs'].to_epsg()})" if raw["crs"] is not None and raw["crs"].to_epsg() else ""),
-                    list(crs_choices.keys()), key=f"rp_crs_{i}")
-            st_field = None
-            if stat_sel == "حسب حقل داخل الملف":
-                if raw["fields"]:
-                    st_field = st.selectbox("الحقل اللي يحدد الحالة (قائم / مقترح / مستقبلي ...)", raw["fields"], key=f"rp_sf_{i}")
+                if case_field:
+                    st.success(f"✅ {len(raw['features'])} عنصر — حقل الحالة: {case_field}")
                 else:
-                    st.warning("الملف ما فيه حقول وصفية — اختر حالة ثابتة.")
-            crs_final = pr.CRS.from_epsg(crs_choices[crs_lbl]) if crs_choices[crs_lbl] else raw["crs"]
+                    case_field = st.selectbox("ما لقيت حقل اسمه case — اختر الحقل:", raw["fields"], key="rp_case_f")
+            with k2:
+                crs_opts = {"تلقائي (من الملف)": None, "WGS84 (4326)": 4326, "Ain el Abd UTM 38N (20438)": 20438,
+                            "Ain el Abd UTM 39N (20439)": 20439}
+                crs_lbl = st.selectbox("نظام إحداثيات الملف", list(crs_opts.keys()), key="rp_crs")
+            crs_final = pr.CRS.from_epsg(crs_opts[crs_lbl]) if crs_opts[crs_lbl] else raw["crs"]
             if crs_final is None:
-                st.error("❌ نظام الإحداثيات غير معروف لهذا الملف — اخترها من القائمة.")
-                continue
-            layer_cfgs.append(dict(name=lname, file=uf.name, raw=raw, crs=crs_final,
-                                   mode="field" if st_field else "fixed",
-                                   value=None if stat_sel == "حسب حقل داخل الملف" else stat_sel, field=st_field))
-    for e in load_errors:
-        st.error(f"❌ {e}")
+                st.error("❌ نظام الإحداثيات غير معروف — اخترها من القائمة.")
+            else:
+                layer = (raw, crs_final, case_field)
+        except Exception as e:
+            st.error(f"❌ {e}")
 
-    # ---- 3) المعاملات ----
-    st.markdown("#### 3️⃣ معايير التحليل")
-    p1, p2, p3 = st.columns(3)
-    with p1:
-        on_tol = st.number_input("«على الخط» إذا المسافة ≤ (م)", 0.5, 50.0, 3.0, 0.5, key="rp_on")
-    with p2:
-        near_tol = st.number_input("«بجوار الخط» إذا المسافة ≤ (م)", 1.0, 500.0, 25.0, 1.0, key="rp_near")
-    with p3:
-        search_r = st.number_input("نطاق البحث للجدول (م)", 50.0, 3000.0, 300.0, 50.0, key="rp_rad")
-    q1, q2 = st.columns(2)
-    with q1:
-        preparer = st.text_input("اسم المُعِدّ (اختياري)", key="rp_preparer")
-    with q2:
-        rp_notes = st.text_area("ملاحظات تظهر بالتقرير (اختياري)", height=68, key="rp_notes")
+    with st.expander("⚙️ إعدادات التحليل"):
+        e1, e2 = st.columns(2)
+        with e1:
+            on_tol = st.number_input("«على الخط» إذا المسافة ≤ (م)", 0.5, 50.0, 3.0, 0.5, key="rp_on")
+        with e2:
+            near_tol = st.number_input("«بجوار الخط» إذا المسافة ≤ (م)", 1.0, 500.0, 25.0, 1.0, key="rp_near")
 
     if st.button("📄 إنشاء التقرير", type="primary", key="rp_go"):
         if point_id <= 0:
@@ -1552,28 +1524,23 @@ with tab_report:
                 elif row.get("__lat") is None:
                     st.error("❌ هذي النقطة ما لها موقع مسجّل")
                 else:
-                    with st.spinner("جاري التحليل وبناء الخرائط..."):
-                        feats, infos = [], []
-                        for c in layer_cfgs:
-                            lf = pr.prepare_layer(c["name"], c["raw"], c["crs"], c["mode"], c["value"], c["field"], TABLE_SRID)
-                            feats += lf
-                            infos.append({"name": c["name"], "file": c["file"], "count": len(lf),
-                                          "status_desc": f"حقل «{c['field']}»" if c["mode"] == "field" else c["value"],
-                                          "epsg": c["crs"].to_epsg() or "مخصص"})
+                    with st.spinner("جاري إعداد التقرير وتحميل الصورة الجوية..."):
+                        feats = pr.prepare_layer(layer[0], layer[1], layer[2], TABLE_SRID) if layer else []
                         an = pr.analyze_point(float(row["__lat"]), float(row["__lng"]), feats,
-                                              on_tol, max(near_tol, on_tol), search_r, TABLE_SRID)
-                        attrs = {k: v for k, v in row.items() if not str(k).startswith("__")}
-                        html_doc = pr.build_report_html(an, attrs, infos, point_id, LONG_TEXT_COLUMNS, preparer, rp_notes)
-                    st.session_state["rp_html"] = html_doc
-                    st.session_state["rp_meta"] = (point_id, an["headline"])
+                                              on_tol, max(near_tol, on_tol), TABLE_SRID)
+                        png, pdf = pr.render_report(an, point_id, row.get("وصف_الموقع") or "")
+                    st.session_state["rp_out"] = (point_id, png, pdf)
             except Exception as e:
-                st.session_state.pop("rp_html", None)
+                st.session_state.pop("rp_out", None)
                 st.error(f"❌ تعذر إنشاء التقرير: {e}")
 
-    if st.session_state.get("rp_html"):
-        pid, headline = st.session_state["rp_meta"]
-        st.success(f"✅ تقرير النقطة {pid}: {headline}")
-        st.download_button("⬇️ تنزيل التقرير (HTML — يفتح بأي متصفح ويُطبع PDF)",
-                           data=st.session_state["rp_html"].encode("utf-8"),
-                           file_name=f"point_{pid}_report.html", mime="text/html", key="rp_dl")
-        components.html(st.session_state["rp_html"], height=1100, scrolling=True)
+    if st.session_state.get("rp_out"):
+        pid, png, pdf = st.session_state["rp_out"]
+        d1, d2, _ = st.columns([1, 1, 2])
+        with d1:
+            st.download_button("🖼️ تحميل صورة PNG", png, file_name=f"point_{pid}_report.png", mime="image/png",
+                               use_container_width=True, key="rp_dl_png")
+        with d2:
+            st.download_button("📕 تحميل PDF", pdf, file_name=f"point_{pid}_report.pdf", mime="application/pdf",
+                               use_container_width=True, key="rp_dl_pdf")
+        st.image(png, use_container_width=True)
