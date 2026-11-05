@@ -340,7 +340,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
-from PIL import Image
+from PIL import Image, ImageEnhance
+from matplotlib import patheffects as pe
 import arabic_reshaper
 from bidi.algorithm import get_display
 
@@ -431,6 +432,7 @@ def analyze_point(lat, lng, features, on_tol=3.0, near_tol=25.0, metric_epsg=204
 # الخريطة الثابتة (صورة جوية) + صفحة التقرير PNG/PDF
 # =========================================================
 ESRI_IMAGERY = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+OSM_TILES = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 
 
 try:
@@ -452,34 +454,44 @@ def _merc(lon, lat, z):
     return x, y
 
 
-def _fetch_tile(z, x, y):
+def _fetch_tile(url, z, x, y):
     try:
-        r = requests.get(ESRI_IMAGERY.format(z=z, x=x, y=y), timeout=10, headers={"User-Agent": "point-manager/1.0"})
+        r = requests.get(url.format(z=z, x=x, y=y), timeout=10, headers={"User-Agent": "point-manager/1.0"})
         r.raise_for_status()
         return Image.open(io.BytesIO(r.content)).convert("RGB")
     except Exception:
         return None
 
 
-def _aerial_background(lat, lng, radius_m, aspect):
-    z = int(math.floor(math.log2(156543.03 * math.cos(math.radians(lat)) * 1000 / (2 * radius_m))))
-    z = max(1, min(19, z))
+def _tile_crop(url, lat, lng, z, half_w, half_h):
+    """يجمّع التايلات ويقص صورة مركزها (lat,lng) بنصف عرض/ارتفاع بالبكسل. يرجع (صورة, (x0,y0), نجاح)"""
     cx, cy = _merc(lng, lat, z)
-    mpp = 156543.03 * math.cos(math.radians(lat)) / 2 ** z
-    hw = radius_m / mpp
-    hh = hw / aspect
-    x0, x1, y0, y1 = cx - hw, cx + hw, cy - hh, cy + hh
-    tx0, tx1, ty0, ty1 = int(x0 // 256), int(x1 // 256), int(y0 // 256), int(y1 // 256)
+    x0, x1, y0, y1 = cx - half_w, cx + half_w, cy - half_h, cy + half_h
+    n = 2 ** z
+    tx0, tx1 = int(x0 // 256), int(x1 // 256)
+    ty0, ty1 = max(int(y0 // 256), 0), min(int(y1 // 256), n - 1)
     canvas = Image.new("RGB", ((tx1 - tx0 + 1) * 256, (ty1 - ty0 + 1) * 256), (205, 210, 215))
     jobs = [(tx, ty) for tx in range(tx0, tx1 + 1) for ty in range(ty0, ty1 + 1)]
     ok = 0
     with _cf.ThreadPoolExecutor(8) as ex:
-        for (tx, ty), img in zip(jobs, ex.map(lambda t: _fetch_tile(z, t[0], t[1]), jobs)):
+        for (tx, ty), img in zip(jobs, ex.map(lambda t: _fetch_tile(url, z, t[0] % n, t[1]), jobs)):
             if img is not None:
                 canvas.paste(img, ((tx - tx0) * 256, (ty - ty0) * 256))
                 ok += 1
-    crop = canvas.crop((int(x0 - tx0 * 256), int(y0 - ty0 * 256), int(x1 - tx0 * 256), int(y1 - ty0 * 256)))
-    return crop, (x0, y0), z, mpp, ok > 0
+    crop = canvas.crop((int(x0 - tx0 * 256), int(y0 - max(ty0, 0) * 256), int(x1 - tx0 * 256), int(y1 - max(ty0, 0) * 256)))
+    return crop, (x0, y0), ok > 0
+
+
+def _aerial_background(lat, lng, radius_m, aspect):
+    z = int(math.floor(math.log2(156543.03 * math.cos(math.radians(lat)) * 1500 / (2 * radius_m))))
+    z = max(1, min(19, z))
+    mpp = 156543.03 * math.cos(math.radians(lat)) / 2 ** z
+    hw = radius_m / mpp
+    crop, origin, ok = _tile_crop(ESRI_IMAGERY, lat, lng, z, hw, hw / aspect)
+    # لمسة باهتة قليلًا (مثل خرائط ArcGIS) عشان الخطوط تبان أوضح
+    crop = ImageEnhance.Color(crop).enhance(0.75)
+    crop = Image.blend(crop, Image.new("RGB", crop.size, (255, 255, 255)), 0.16)
+    return crop, origin, z, mpp, ok
 
 
 def _parts(g):
@@ -490,66 +502,61 @@ def _parts(g):
         yield g
 
 
+def _panel(fig, left, bottom, width, height):
+    ax = fig.add_axes([left, bottom, width, height], facecolor="white")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for sp in ax.spines.values():
+        sp.set_linestyle((0, (4, 3)))
+        sp.set_edgecolor("#8a8a8a")
+        sp.set_linewidth(1.1)
+    return ax
+
+
 def render_report(analysis, point_id, description, dpi=200, view=None):
-    """يرجع (png_bytes, pdf_bytes) لصفحة A4 فيها: العنوان، وصف الموقع، علاقة الشبكة، الخريطة بالصورة الجوية."""
+    """يرجع (png_bytes, pdf_bytes): صفحة A4 أفقية على نمط خرائط ArcGIS:
+    خريطة جوية كبيرة + عمود جانبي (خريطة موقع عامة، المصطلحات، الموضوع، علاقة الشبكة، مقياس الرسم)."""
     lat, lng = analysis["lat"], analysis["lng"]
     feats = analysis["features"]
     colors = case_colors(feats)
     near = analysis["nearest"]
-    if view:  # (south, west, north, east) من خريطة المعاينة: نفس المركز ونفس عرض الخريطة
+    W_IN, H_IN = 11.69, 8.27
+    MAP_L, MAP_B, MAP_W, MAP_H = 0.022, 0.03, 0.76, 0.94
+    ax_w_in, ax_h_in = MAP_W * W_IN, MAP_H * H_IN
+    aspect = ax_w_in / ax_h_in
+
+    if view:
         vs, vw, vn, ve = view
         clat, clng = (vs + vn) / 2, (vw + ve) / 2
         radius = max(15.0, (ve - vw) * 111320 * math.cos(math.radians(clat)) / 2)
     else:
         clat, clng = lat, lng
         radius = max(120.0, min((near or 0) * 1.3, 600.0), analysis["near_tol"] * 3)
-    aspect = 7.3 / 6.6
     bg, (ox, oy), z, mpp, tiles_ok = _aerial_background(clat, clng, radius, aspect)
     dlat_v = radius * 2 / 111320.0
     dlng_v = dlat_v / max(math.cos(math.radians(clat)), 0.2)
 
     plt.rcParams["font.family"] = "DejaVu Sans"
-    fig = plt.figure(figsize=(8.27, 11.69), dpi=dpi, facecolor="white")
-    W = 8.27
+    fig = plt.figure(figsize=(W_IN, H_IN), dpi=dpi, facecolor="#6aa84f")
+    fig.add_artist(Rectangle((0.006, 0.009), 0.988, 0.982, transform=fig.transFigure,
+                             facecolor="white", edgecolor="#3d7a1f", linewidth=1.3, zorder=-10))
+    fig.add_artist(Rectangle((0.012, 0.017), 0.976, 0.966, transform=fig.transFigure,
+                             facecolor="white", edgecolor="#9ccc65", linewidth=2.2, zorder=-9))
 
-    # ---- الترويسة ----
-    fig.add_artist(Rectangle((0, 0.925), 1, 0.075, transform=fig.transFigure, color="#0b4f9e"))
-    fig.text(0.5, 0.963, ar("تقرير نقطة التجمع"), color="white", fontsize=24, fontweight="bold", ha="center", va="center")
-
-    # ---- وصف الموقع ----
-    fig.text(0.95, 0.895, ar("وصف الموقع"), color="#0b4f9e", fontsize=13, fontweight="bold", ha="right", va="center")
-    desc = (description or "").strip() or "—"
-    wrapped = textwrap.wrap(desc, 75)[:5]
-    y = 0.872
-    for ln_ in wrapped:
-        fig.text(0.95, y, ar(ln_), color="#1b2a3b", fontsize=11, ha="right", va="center")
-        y -= 0.0185
-
-    # ---- علاقة الشبكة ----
-    y -= 0.008
-    box_h = 0.026 + 0.021 * max(len(analysis["lines"]), 1)
-    fig.add_artist(Rectangle((0.05, y - box_h), 0.9, box_h, transform=fig.transFigure,
-                             facecolor="#eef5fc", edgecolor="#b9d3ee", linewidth=1))
-    fig.text(0.94, y - 0.014, ar(analysis["headline"]), color="#0b4f9e", fontsize=12, fontweight="bold", ha="right", va="center")
-    yy = y - 0.014 - 0.021
-    for ln_ in analysis["lines"]:
-        fig.text(0.94, yy, ar("• " + ln_), color="#1b2a3b", fontsize=10.5, ha="right", va="center")
-        yy -= 0.021
-    top = y - box_h - 0.012
-
-    # ---- الخريطة ----
-    ax_h = (7.3 / aspect) / 11.69
-    ax = fig.add_axes([0.05, max(top - ax_h, 0.04), 0.9, ax_h])
-    ax.imshow(bg, extent=(0, bg.width, bg.height, 0), interpolation="bilinear")
+    # ================= الخريطة الرئيسية =================
+    ax = fig.add_axes([MAP_L, MAP_B, MAP_W, MAP_H])
+    ax.imshow(bg, extent=(0, bg.width, bg.height, 0), interpolation="bilinear", aspect="auto")
     ax.set_xlim(0, bg.width)
     ax.set_ylim(bg.height, 0)
     ax.set_xticks([])
     ax.set_yticks([])
     for sp in ax.spines.values():
-        sp.set_edgecolor("#0b4f9e")
-        sp.set_linewidth(1.5)
+        sp.set_edgecolor("#333333")
+        sp.set_linewidth(1.2)
     if not tiles_ok:
-        ax.text(0.5, 0.5, ar("تعذر تحميل الصورة الجوية"), transform=ax.transAxes, ha="center", color="#555", fontsize=14)
+        ax.text(0.5, 0.55, ar("تعذر تحميل الصورة الجوية"), transform=ax.transAxes, ha="center", color="#555", fontsize=14)
 
     def xy(lon, la):
         px, py = _merc(lon, la, z)
@@ -566,53 +573,105 @@ def render_report(analysis, point_id, description, dpi=200, view=None):
             t = g.geom_type
             if t == "LineString":
                 pts = [xy(*c[:2]) for c in g.coords]
-                ax.plot(*zip(*pts), color="white", lw=5.5, alpha=0.6, solid_capstyle="round", zorder=3)
-                ax.plot(*zip(*pts), color=col, lw=3, solid_capstyle="round", zorder=4)
+                ax.plot(*zip(*pts), color="white", lw=4.2, alpha=0.55, solid_capstyle="round", zorder=3)
+                ax.plot(*zip(*pts), color=col, lw=2.3, solid_capstyle="round", zorder=4)
             elif t == "Polygon":
                 pts = [xy(*c[:2]) for c in g.exterior.coords]
-                ax.plot(*zip(*pts), color=col, lw=2.5, zorder=4)
+                ax.plot(*zip(*pts), color=col, lw=2.2, zorder=4)
                 ax.fill(*zip(*pts), color=col, alpha=0.2, zorder=3)
             elif t == "Point":
                 px_, py_ = xy(g.x, g.y)
-                ax.scatter([px_], [py_], s=60, color=col, edgecolor="white", linewidth=1.2, zorder=5)
+                ax.scatter([px_], [py_], s=45, color=col, edgecolor="white", linewidth=1, zorder=5)
 
-    # دوائر النطاق ثم نقطة التجمع
     cx, cy = xy(lng, lat)
-    for r_m, ls in ((analysis["near_tol"], "--"),):
-        ax.add_patch(plt.Circle((cx, cy), r_m / mpp, fill=False, edgecolor="#ffd600", lw=1.6, ls=ls, zorder=6))
-    ax.scatter([cx], [cy], s=520, color="#ff1744", alpha=0.25, zorder=7)
-    ax.scatter([cx], [cy], s=140, color="#ff1744", edgecolor="white", linewidth=2.2, zorder=8)
+    ax.add_patch(plt.Circle((cx, cy), analysis["near_tol"] / mpp, fill=False, edgecolor="#ffd600",
+                            lw=1.4, ls="--", zorder=6))
+    ax.scatter([cx], [cy], s=70, color="#e60000", edgecolor="white", linewidth=1.3, zorder=8)
+    halo = [pe.withStroke(linewidth=3.2, foreground="white")]
+    ax.text(cx + bg.width * 0.011, cy - bg.height * 0.004, ar("موقع التجمع"), fontsize=11, fontweight="bold",
+            color="black", ha="left", va="center", zorder=9, path_effects=halo)
 
-    # مقياس الرسم
-    nice = next((v for v in (1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000) if v / mpp > bg.width * 0.12), 1000)
-    bar = nice / mpp
-    bx, by = bg.width * 0.04, bg.height * 0.95
-    pad, bh = bg.width * 0.012, bg.height * 0.055
-    ax.add_patch(Rectangle((bx - pad, by - bh * 0.85), bar + 2 * pad, bh, color="white", alpha=0.78, zorder=9))
-    ax.plot([bx, bx + bar], [by, by], color="black", lw=3, zorder=10)
-    ax.text(bx + bar / 2, by - bh * 0.15, f"{nice} m", ha="center", va="bottom", fontsize=8, fontweight="bold", zorder=10)
-    # اتجاه الشمال
-    ax.annotate("N", xy=(bg.width * 0.95, bg.height * 0.05), xytext=(bg.width * 0.95, bg.height * 0.15),
-                ha="center", va="center", fontsize=11, fontweight="bold", color="white",
-                arrowprops=dict(arrowstyle="-|>", color="white", lw=2.2), zorder=10)
+    # اتجاه الشمال + مصدر الصورة
+    ax.scatter([0.955], [0.885], s=1500, color="white", alpha=0.85, transform=ax.transAxes, zorder=9)
+    ax.annotate("", xy=(0.955, 0.935), xytext=(0.955, 0.865), xycoords="axes fraction",
+                arrowprops=dict(arrowstyle="-|>", color="black", lw=2), zorder=10)
+    ax.text(0.955, 0.84, "N", transform=ax.transAxes, ha="center", va="center", fontsize=10, fontweight="bold", zorder=10)
+    ax.text(0.99, 0.012, "Esri World Imagery", transform=ax.transAxes, ha="right", fontsize=6.5, color="white",
+            path_effects=[pe.withStroke(linewidth=2, foreground="#444444")], zorder=10)
 
-    # مفتاح الخريطة: نقطة التجمع + الشبكة حسب case
-    handles = [Line2D([0], [0], marker="o", color="none", markerfacecolor="#ff1744", markeredgecolor="white",
-                      markersize=11, label=ar("نقطة التجمع"))]
-    present = sorted(in_view)
-    for c in present:
-        handles.append(Line2D([0], [0], color=colors[c], lw=4, label=ar(f"شبكة سيول: {c}")))
-    leg = ax.legend(handles=handles, loc="lower right", fontsize=9.5, framealpha=0.93, title=ar("مفتاح الخريطة"),
-                    title_fontsize=10, borderpad=0.8)
-    leg.get_frame().set_edgecolor("#0b4f9e")
-    leg.set_zorder(20)
+    # ================= العمود الجانبي =================
+    PL, PW = 0.79, 0.19
+    gap = 0.008
+    heights = [0.30, 0.223, 0.15, 0.15, 0.085]
+    tops, y = [], 0.97
+    for h in heights:
+        tops.append(y)
+        y -= h + gap
+    panel_w_in = PW * W_IN
 
-    fig.text(0.05, 0.022, f"WGS84: {lat:.6f}, {lng:.6f}", fontsize=8.5, color="#6b7a8c", ha="left")
-    fig.text(0.95, 0.022, ar("تاريخ التقرير: ") + datetime.datetime.now().strftime("%Y-%m-%d"),
-             fontsize=8.5, color="#6b7a8c", ha="right")
+    def pan(idx):
+        return _panel(fig, PL, tops[idx] - heights[idx], PW, heights[idx])
+
+    # 1) خريطة الموقع العامة
+    a1 = pan(0)
+    ph_in = heights[0] * H_IN
+    half_w = 260
+    ov, _, ov_ok = _tile_crop(OSM_TILES, lat, lng, 11, half_w, half_w * ph_in / panel_w_in)
+    a1.imshow(ov, extent=(0, 1, 0, 1), aspect="auto", interpolation="bilinear")
+    a1.scatter([0.5], [0.5], s=26, color="#e60000", edgecolor="white", linewidth=0.8, zorder=5)
+    a1.text(0.5, 0.012, "© OpenStreetMap contributors", ha="center", va="bottom", fontsize=5.5, color="#333",
+            bbox=dict(facecolor="white", alpha=0.75, edgecolor="none", pad=1.2))
+
+    # 2) المصطلحات
+    a2 = pan(1)
+    a2.text(0.95, 0.9, ar("المصطلحات"), ha="right", va="center", fontsize=15, color="#222")
+    cases = sorted(in_view)
+    n_items = len(cases) + 1
+    step = min(0.115, 0.66 / max(n_items, 1))
+    yy = 0.74
+    a2.scatter([0.905], [yy], s=45, color="#e60000", edgecolor="white", linewidth=0.8, zorder=5)
+    a2.text(0.82, yy, ar("نقطة التجمع"), ha="right", va="center", fontsize=9.5, color="#333")
+    for c in cases:
+        yy -= step
+        a2.plot([0.86, 0.96], [yy, yy], color=colors[c], lw=3, solid_capstyle="round")
+        a2.text(0.82, yy, ar(f"شبكة سيول: {c}"), ha="right", va="center", fontsize=9.5, color="#333")
+
+    # 3) الموضوع (وصف الموقع)
+    a3 = pan(2)
+    a3.text(0.95, 0.83, ar("الموضوع"), ha="right", va="center", fontsize=15, color="#222")
+    desc = (description or "").strip() or "—"
+    ly = 0.62
+    for ln_ in textwrap.wrap(desc, 27)[:4]:
+        a3.text(0.95, ly, ar(ln_), ha="right", va="center", fontsize=9.5, color="#333")
+        ly -= 0.14
+
+    # 4) علاقة النقطة بالشبكة
+    a4 = pan(3)
+    a4.text(0.95, 0.83, ar(analysis["headline"]), ha="right", va="center", fontsize=9.5, fontweight="bold", color="#222")
+    ly = 0.62
+    for item in analysis["lines"][:3]:
+        for ln_ in textwrap.wrap(item, 30)[:2]:
+            a4.text(0.95, ly, ar(ln_), ha="right", va="center", fontsize=8.5, color="#333")
+            ly -= 0.125
+
+    # 5) مقياس الرسم (مرتبط بمقياس الخريطة الفعلي)
+    a5 = pan(4)
+    m_per_in = (2 * radius) / ax_w_in
+    nice = max((v for v in (1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000) if v / m_per_in <= panel_w_in * 0.62), default=1)
+    bar_in = nice / m_per_in
+    bx0 = (panel_w_in - bar_in) / 2 / panel_w_in
+    seg = bar_in / panel_w_in / 4
+    for k in range(4):
+        a5.add_patch(Rectangle((bx0 + k * seg, 0.50), seg, 0.16, facecolor="black" if k % 2 == 0 else "white",
+                               edgecolor="black", linewidth=0.8))
+    unit_km = nice >= 1000
+    fmt = (lambda v: f"{v / 1000:g}") if unit_km else (lambda v: f"{v:g}")
+    for frac in (0, 0.5, 1):
+        a5.text(bx0 + frac * seg * 4, 0.40, fmt(nice * frac), ha="center", va="top", fontsize=8)
+    a5.text(0.5, 0.06, ar("كيلومتر" if unit_km else "متر"), ha="center", va="bottom", fontsize=9)
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=dpi, facecolor="white")
+    fig.savefig(buf, format="png", dpi=dpi, facecolor=fig.get_facecolor())
     plt.close(fig)
     png = buf.getvalue()
     pdf_buf = io.BytesIO()
