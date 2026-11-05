@@ -1,8 +1,12 @@
 streamlit
-pandas
-sqlalchemy>=2.0
-psycopg[binary]
-folium
 streamlit-folium
+folium
+sqlalchemy
+psycopg[binary]
+pandas
 openpyxl
 pyshp
+shapely>=2.0
+pyproj
+# اختياري لصيغ GPKG/GML/DXF:
+# geopandas
