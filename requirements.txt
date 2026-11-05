@@ -8,5 +8,8 @@ openpyxl
 pyshp
 shapely>=2.0
 pyproj
-# اختياري لصيغ GPKG/GML/DXF:
-# geopandas
+matplotlib
+pillow
+arabic-reshaper
+python-bidi
+requests
