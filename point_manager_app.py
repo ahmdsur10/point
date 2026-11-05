@@ -1464,6 +1464,17 @@ def _read_network_cached(filename, data):
     return pr.read_network_file(filename, data)
 
 
+@st.cache_data(show_spinner=False)
+def _prepare_cached(filename, data, crs_wkt, case_field):
+    raw = pr.read_network_file(filename, data)
+    return pr.prepare_layer(raw, pr.CRS.from_wkt(crs_wkt), case_field, TABLE_SRID)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _rp_point_cached(pid):
+    return get_point_full(pid)
+
+
 with tab_report:
     st.subheader("📄 تقرير نقطة التجمع")
     st.caption("اختر النقطة وارفع شبكة السيول (Shapefile ZIP أو GeoJSON)، وبيطلع تقرير بخريطة الصورة الجوية تقدر تحمله صورة أو PDF.")
@@ -1506,6 +1517,54 @@ with tab_report:
         except Exception as e:
             st.error(f"❌ {e}")
 
+    # ---- خريطة المعاينة: حدّد التكبير/التصغير والمنظر اللي تبيه بالتقرير ----
+    rp_view = None
+    prev_pt = None
+    if point_id > 0:
+        try:
+            prev_pt = _rp_point_cached(point_id)
+        except Exception as e:
+            st.error(f"❌ {e}")
+    if prev_pt and prev_pt.get("__lat") is not None:
+        plat, plng = float(prev_pt["__lat"]), float(prev_pt["__lng"])
+        st.markdown("#### 🔎 حدّد منظر الخريطة")
+        st.caption("كبّر / صغّر وحرّك الخريطة (صورة جوية) للمنظر اللي تبيه — التقرير يطلع بنفس مركز وعرض الخريطة اللي تشوفها هنا.")
+        pm = folium.Map(location=[plat, plng], zoom_start=18, max_zoom=19, tiles=None, control_scale=True)
+        folium.TileLayer(
+            "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            attr="Esri World Imagery", name="صورة جوية", max_zoom=19,
+        ).add_to(pm)
+        if layer:
+            try:
+                crs_wkt = layer[1].to_wkt()
+                pfeats = _prepare_cached(net_file.name, net_file.getvalue(), crs_wkt, layer[2])
+                pcolors = pr.case_colors(pfeats)
+                dl, dg = 0.012, 0.013
+                shown = 0
+                for pf in pfeats:
+                    b0, b1, b2, b3 = pf["geom_w"].bounds
+                    if b2 < plng - dg or b0 > plng + dg or b3 < plat - dl or b1 > plat + dl:
+                        continue
+                    folium.GeoJson(
+                        pr.mapping(pf["geom_w"]),
+                        style_function=lambda _x, c=pcolors[pf["case"]]: {"color": c, "weight": 4, "fillOpacity": 0.2},
+                        tooltip=pf["case"],
+                    ).add_to(pm)
+                    shown += 1
+                    if shown >= 600:
+                        break
+            except Exception as e:
+                st.warning(f"تعذر رسم الشبكة بالمعاينة: {e}")
+        folium.CircleMarker([plat, plng], radius=9, color="white", weight=2, fill=True,
+                            fill_color="#ff1744", fill_opacity=1, tooltip="نقطة التجمع").add_to(pm)
+        prev_out = st_folium(pm, width="100%", height=480, returned_objects=["bounds"], key=f"rp_prev_{point_id}")
+        if prev_out and prev_out.get("bounds"):
+            bb = prev_out["bounds"]
+            rp_view = (bb["_southWest"]["lat"], bb["_southWest"]["lng"],
+                       bb["_northEast"]["lat"], bb["_northEast"]["lng"])
+        else:
+            st.caption("ℹ️ لو ما حركت الخريطة بيستخدم التقرير تكبير تلقائي مناسب.")
+
     with st.expander("⚙️ إعدادات التحليل"):
         e1, e2 = st.columns(2)
         with e1:
@@ -1528,7 +1587,7 @@ with tab_report:
                         feats = pr.prepare_layer(layer[0], layer[1], layer[2], TABLE_SRID) if layer else []
                         an = pr.analyze_point(float(row["__lat"]), float(row["__lng"]), feats,
                                               on_tol, max(near_tol, on_tol), TABLE_SRID)
-                        png, pdf = pr.render_report(an, point_id, row.get("وصف_الموقع") or "")
+                        png, pdf = pr.render_report(an, point_id, row.get("وصف_الموقع") or "", view=rp_view)
                     st.session_state["rp_out"] = (point_id, png, pdf)
             except Exception as e:
                 st.session_state.pop("rp_out", None)
