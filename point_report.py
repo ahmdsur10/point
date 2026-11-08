@@ -515,12 +515,174 @@ def _panel(fig, left, bottom, width, height):
     return ax
 
 
-def render_report(analysis, point_id, description, dpi=200, view=None):
+def _hex_ok(c):
+    return isinstance(c, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", c) is not None
+
+
+def _legend_maps(feats, legend):
+    """يدمج الألوان/النصوص المخصصة (legend: {case: {"label":..., "color":"#rrggbb"}}) مع الافتراضي."""
+    colors = case_colors(feats)
+    labels = {c: f"شبكة سيول: {c}" for c in colors}
+    for c, cfg in (legend or {}).items():
+        if not isinstance(cfg, dict):
+            continue
+        if _hex_ok(cfg.get("color")):
+            colors[c] = cfg["color"]
+        if (cfg.get("label") or "").strip():
+            labels[c] = cfg["label"].strip()
+    return colors, labels
+
+
+def _draw_features(ax, feats, colors, xy, clat, clng, dlat_v, dlng_v, scale=1.0):
+    in_view = set()
+    for f in feats:
+        bx0, by0, bx1, by1 = f["geom_w"].bounds
+        if bx1 < clng - dlng_v or bx0 > clng + dlng_v or by1 < clat - dlat_v or by0 > clat + dlat_v:
+            continue
+        in_view.add(f["case"])
+        col = colors[f["case"]]
+        for g in _parts(f["geom_w"]):
+            t = g.geom_type
+            if t == "LineString":
+                pts = [xy(*c[:2]) for c in g.coords]
+                ax.plot(*zip(*pts), color="white", lw=4.2 * scale, alpha=0.55, solid_capstyle="round", zorder=3)
+                ax.plot(*zip(*pts), color=col, lw=2.3 * scale, solid_capstyle="round", zorder=4)
+            elif t == "Polygon":
+                pts = [xy(*c[:2]) for c in g.exterior.coords]
+                ax.plot(*zip(*pts), color=col, lw=2.2 * scale, zorder=4)
+                ax.fill(*zip(*pts), color=col, alpha=0.2, zorder=3)
+            elif t == "Point":
+                px_, py_ = xy(g.x, g.y)
+                ax.scatter([px_], [py_], s=45 * scale, color=col, edgecolor="white", linewidth=1, zorder=5)
+    return in_view
+
+
+def _view_params(analysis, view):
+    lat, lng = analysis["lat"], analysis["lng"]
+    near = analysis.get("nearest")
+    if view:
+        vs, vw, vn, ve = view
+        clat, clng = (vs + vn) / 2, (vw + ve) / 2
+        radius = max(15.0, (ve - vw) * 111320 * math.cos(math.radians(clat)) / 2)
+    else:
+        clat, clng = lat, lng
+        radius = max(120.0, min((near or 0) * 1.3, 600.0), analysis["near_tol"] * 3)
+    return clat, clng, radius
+
+
+def _fig_to_png_pdf(fig, dpi):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    png = buf.getvalue()
+    pdf_buf = io.BytesIO()
+    Image.open(io.BytesIO(png)).convert("RGB").save(pdf_buf, "PDF", resolution=dpi)
+    return png, pdf_buf.getvalue()
+
+
+def _draw_map_legend(fig, ax, point_label, items, fontsize=11.5):
+    """مفتاح خريطة داخل الخريطة (أسفل اليمين): نقطة التجمع + أنواع الشبكة. items = [(label, color)]"""
+    h_in = fig.get_size_inches()[1]
+    step = (fontsize * 2.15 / 72) / h_in
+    pad_y, pad_x = 0.016, 0.010
+    sw_w = 0.04
+    right = 0.985
+    box_h = (1 + len(items)) * step + 2 * pad_y
+    bottom = 0.03
+    top_y = bottom + box_h - pad_y - step / 2
+    text_right = right - pad_x - sw_w - 0.008
+    rows = [("point", point_label, "#e60000")] + [("line", lb, col) for lb, col in items]
+    texts, y = [], top_y
+    for kind, lb, col in rows:
+        t = ax.text(text_right, y, ar(lb), transform=ax.transAxes, ha="right", va="center",
+                    fontsize=fontsize, color="#222", zorder=13)
+        texts.append(t)
+        x0, x1 = right - pad_x - sw_w, right - pad_x
+        if kind == "point":
+            ax.scatter([(x0 + x1) / 2], [y], transform=ax.transAxes, s=95, color=col,
+                       edgecolor="white", linewidth=1.4, zorder=13)
+        else:
+            ax.plot([x0, x1], [y, y], transform=ax.transAxes, color=col, lw=4, solid_capstyle="round", zorder=13)
+        y -= step
+    renderer = fig.canvas.get_renderer()
+    inv = ax.transAxes.inverted()
+    wmax = max(t.get_window_extent(renderer).transformed(inv).width for t in texts)
+    left = text_right - wmax - pad_x * 1.4
+    ax.add_patch(Rectangle((left, bottom), right - left, box_h, transform=ax.transAxes, facecolor="white",
+                           alpha=0.93, edgecolor="#777777", linewidth=1.1, linestyle=(0, (4, 3)), zorder=12))
+
+
+def render_full_map(analysis, dpi=200, view=None, legend=None, point_label="نقطة التجمع",
+                    show_north=False, show_scale=False):
+    """خريطة بالصورة الجوية تملأ كامل الصورة (A4 أفقي) + مفتاح خريطة فقط. يرجع (png, pdf)."""
+    lat, lng = analysis["lat"], analysis["lng"]
+    feats = analysis["features"]
+    colors, labels = _legend_maps(feats, legend)
+    W_IN, H_IN = 11.69, 8.27
+    clat, clng, radius = _view_params(analysis, view)
+    bg, (ox, oy), z, mpp, tiles_ok = _aerial_background(clat, clng, radius, W_IN / H_IN)
+    dlat_v = radius * 2 / 111320.0
+    dlng_v = dlat_v / max(math.cos(math.radians(clat)), 0.2)
+
+    plt.rcParams["font.family"] = "DejaVu Sans"
+    fig = plt.figure(figsize=(W_IN, H_IN), dpi=dpi, facecolor="white")
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.imshow(bg, extent=(0, bg.width, bg.height, 0), interpolation="bilinear", aspect="auto")
+    ax.set_xlim(0, bg.width)
+    ax.set_ylim(bg.height, 0)
+    ax.axis("off")
+    if not tiles_ok:
+        ax.text(0.5, 0.55, ar("تعذر تحميل الصورة الجوية"), transform=ax.transAxes, ha="center", color="#555", fontsize=16)
+
+    def xy(lon, la):
+        px, py = _merc(lon, la, z)
+        return px - ox, py - oy
+
+    in_view = _draw_features(ax, feats, colors, xy, clat, clng, dlat_v, dlng_v, scale=1.25)
+    cx, cy = xy(lng, lat)
+    ax.scatter([cx], [cy], s=130, color="#e60000", edgecolor="white", linewidth=1.8, zorder=8)
+
+    ax.text(0.006, 0.006, "Esri World Imagery", transform=ax.transAxes, ha="left", va="bottom", fontsize=6.5,
+            color="white", path_effects=[pe.withStroke(linewidth=2, foreground="#444444")], zorder=10)
+
+    if show_north:
+        ax.scatter([0.965], [0.9], s=1700, color="white", alpha=0.85, transform=ax.transAxes, zorder=9)
+        ax.annotate("", xy=(0.965, 0.945), xytext=(0.965, 0.885), xycoords="axes fraction",
+                    arrowprops=dict(arrowstyle="-|>", color="black", lw=2), zorder=10)
+        ax.text(0.965, 0.86, "N", transform=ax.transAxes, ha="center", va="center", fontsize=10,
+                fontweight="bold", zorder=10)
+    if show_scale:
+        m_per_in = (2 * radius) / W_IN
+        nice = max((v for v in (1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000)
+                    if v / m_per_in <= 2.2), default=1)
+        bar = nice / m_per_in / W_IN
+        x0, y0, hh = 0.02, 0.045, 0.012
+        ax.add_patch(Rectangle((x0 - 0.008, y0 - 0.03), bar + 0.016, 0.075, transform=ax.transAxes,
+                               color="white", alpha=0.85, zorder=9))
+        for k in range(4):
+            ax.add_patch(Rectangle((x0 + k * bar / 4, y0), bar / 4, hh, transform=ax.transAxes,
+                                   facecolor="black" if k % 2 == 0 else "white", edgecolor="black",
+                                   linewidth=0.8, zorder=10))
+        unit_km = nice >= 1000
+        fmt = (lambda v: f"{v / 1000:g}") if unit_km else (lambda v: f"{v:g}")
+        for frac in (0, 0.5, 1):
+            ax.text(x0 + frac * bar, y0 - 0.006, fmt(nice * frac), transform=ax.transAxes, ha="center",
+                    va="top", fontsize=8, zorder=10)
+        ax.text(x0 + bar / 2, y0 + hh + 0.006, ar("كيلومتر" if unit_km else "متر"), transform=ax.transAxes,
+                ha="center", va="bottom", fontsize=8.5, zorder=10)
+
+    items = [(labels[c], colors[c]) for c in sorted(in_view)]
+    _draw_map_legend(fig, ax, (point_label or "").strip() or "نقطة التجمع", items)
+    return _fig_to_png_pdf(fig, dpi)
+
+
+
+def render_report(analysis, point_id, description, dpi=200, view=None, legend=None, point_label="نقطة التجمع"):
     """يرجع (png_bytes, pdf_bytes): صفحة A4 أفقية على نمط خرائط ArcGIS:
     خريطة جوية كبيرة + عمود جانبي (خريطة موقع عامة، المصطلحات، الموضوع، علاقة الشبكة، مقياس الرسم)."""
     lat, lng = analysis["lat"], analysis["lng"]
     feats = analysis["features"]
-    colors = case_colors(feats)
+    colors, labels = _legend_maps(feats, legend)
     near = analysis["nearest"]
     W_IN, H_IN = 11.69, 8.27
     MAP_L, MAP_B, MAP_W, MAP_H = 0.022, 0.03, 0.76, 0.94
@@ -562,26 +724,7 @@ def render_report(analysis, point_id, description, dpi=200, view=None):
         px, py = _merc(lon, la, z)
         return px - ox, py - oy
 
-    in_view = set()
-    for f in feats:
-        bx0, by0, bx1, by1 = f["geom_w"].bounds
-        if bx1 < clng - dlng_v or bx0 > clng + dlng_v or by1 < clat - dlat_v or by0 > clat + dlat_v:
-            continue
-        in_view.add(f["case"])
-        col = colors[f["case"]]
-        for g in _parts(f["geom_w"]):
-            t = g.geom_type
-            if t == "LineString":
-                pts = [xy(*c[:2]) for c in g.coords]
-                ax.plot(*zip(*pts), color="white", lw=4.2, alpha=0.55, solid_capstyle="round", zorder=3)
-                ax.plot(*zip(*pts), color=col, lw=2.3, solid_capstyle="round", zorder=4)
-            elif t == "Polygon":
-                pts = [xy(*c[:2]) for c in g.exterior.coords]
-                ax.plot(*zip(*pts), color=col, lw=2.2, zorder=4)
-                ax.fill(*zip(*pts), color=col, alpha=0.2, zorder=3)
-            elif t == "Point":
-                px_, py_ = xy(g.x, g.y)
-                ax.scatter([px_], [py_], s=45, color=col, edgecolor="white", linewidth=1, zorder=5)
+    in_view = _draw_features(ax, feats, colors, xy, clat, clng, dlat_v, dlng_v)
 
     cx, cy = xy(lng, lat)
     ax.add_patch(plt.Circle((cx, cy), analysis["near_tol"] / mpp, fill=False, edgecolor="#ffd600",
@@ -630,11 +773,12 @@ def render_report(analysis, point_id, description, dpi=200, view=None):
     step = min(0.115, 0.66 / max(n_items, 1))
     yy = 0.74
     a2.scatter([0.905], [yy], s=45, color="#e60000", edgecolor="white", linewidth=0.8, zorder=5)
-    a2.text(0.82, yy, ar("نقطة التجمع"), ha="right", va="center", fontsize=9.5, color="#333")
+    _pl = (point_label or "").strip() or "نقطة التجمع"
+    a2.text(0.82, yy, ar(_pl), ha="right", va="center", fontsize=min(9.5, max(6.0, 9.5 * 20 / max(len(_pl), 1))), color="#333")
     for c in cases:
         yy -= step
         a2.plot([0.86, 0.96], [yy, yy], color=colors[c], lw=3, solid_capstyle="round")
-        a2.text(0.82, yy, ar(f"شبكة سيول: {c}"), ha="right", va="center", fontsize=9.5, color="#333")
+        a2.text(0.82, yy, ar(labels[c]), ha="right", va="center", fontsize=min(9.5, max(6.0, 9.5 * 20 / max(len(labels[c]), 1))), color="#333")
 
     # 3) الموضوع (وصف الموقع)
     a3 = pan(2)
