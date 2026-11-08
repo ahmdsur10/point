@@ -1551,6 +1551,15 @@ with tab_report:
                 unsafe_allow_html=True)
             legend_cfg[c] = {"label": lbl, "color": col_hex}
 
+    # ---- خلفية الخريطة: الصورة الجوية + الشوارع + الشفافية ----
+    with st.expander("🖼️ خلفية الخريطة (الصورة الجوية + أسماء الشوارع)", expanded=True):
+        bg_streets = st.checkbox("إظهار خريطة الشوارع بأسمائها تحت الصورة الجوية", value=True, key="rp_streets")
+        bg_transp = st.slider("شفافية الصورة الجوية", 0, 100, 40, 5, format="%d%%", key="rp_transp",
+                              help="0% = صورة جوية معتمة بالكامل (الشوارع مخفية) — كل ما زادت الشفافية ظهرت الشوارع وأسماءها أكثر — 100% = خريطة الشوارع فقط")
+        if bg_streets and bg_transp == 0:
+            st.caption("ℹ️ الصورة معتمة بالكامل، فأسماء الشوارع ما راح تظهر — زِد الشفافية.")
+    bg_alpha = 1.0 - bg_transp / 100.0
+
     # ---- 4) خريطة المعاينة (التكبير والتصغير) ----
     rp_view = None
     prev_pt = None
@@ -1564,9 +1573,11 @@ with tab_report:
         st.markdown("#### 🔎 حدّد منظر الخريطة")
         st.caption("كبّر / صغّر وحرّك الخريطة للمنظر اللي تبيه — التقرير يطلع بنفس مركز وعرض الخريطة اللي تشوفها هنا.")
         pm = folium.Map(location=[plat, plng], zoom_start=18, max_zoom=19, tiles=None, control_scale=True)
+        if bg_streets:
+            folium.TileLayer("OpenStreetMap", name="الشوارع", max_zoom=19).add_to(pm)
         folium.TileLayer(
             "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-            attr="Esri World Imagery", name="صورة جوية", max_zoom=19,
+            attr="Esri World Imagery", name="صورة جوية", max_zoom=19, opacity=bg_alpha,
         ).add_to(pm)
         if feats_all:
             dl, dg, shown = 0.012, 0.013, 0
@@ -1584,7 +1595,14 @@ with tab_report:
                     break
         folium.CircleMarker([plat, plng], radius=9, color="white", weight=2, fill=True,
                             fill_color="#ff1744", fill_opacity=1, tooltip="نقطة التجمع").add_to(pm)
-        prev_out = st_folium(pm, width="100%", height=480, returned_objects=["bounds"], key=f"rp_prev_{point_id}")
+        cz_key = f"rp_cz_{point_id}"
+        cz_kw = {}
+        if st.session_state.get(cz_key):  # نحافظ على التكبير/المنظر لما تغيّر الشفافية أو الألوان
+            cz_kw = {"center": st.session_state[cz_key][0], "zoom": st.session_state[cz_key][1]}
+        prev_out = st_folium(pm, width="100%", height=480, returned_objects=["bounds", "center", "zoom"],
+                             key=f"rp_prev_{point_id}", **cz_kw)
+        if prev_out and prev_out.get("center") and prev_out.get("zoom") is not None:
+            st.session_state[cz_key] = ([prev_out["center"]["lat"], prev_out["center"]["lng"]], prev_out["zoom"])
         if prev_out and prev_out.get("bounds"):
             bb_ = prev_out["bounds"]
             rp_view = (bb_["_southWest"]["lat"], bb_["_southWest"]["lng"],
@@ -1619,10 +1637,12 @@ with tab_report:
                                               RP_ON_TOL, RP_NEAR_TOL, TABLE_SRID)
                         if is_full:
                             png, pdf = pr.render_full_map(an, view=rp_view, legend=legend_cfg, point_label=point_label,
-                                                          show_north=show_north, show_scale=show_scale)
+                                                          show_north=show_north, show_scale=show_scale,
+                                                          aerial_opacity=bg_alpha, streets=bg_streets)
                         else:
                             png, pdf = pr.render_report(an, point_id, row.get("وصف_الموقع") or "", view=rp_view,
-                                                        legend=legend_cfg, point_label=point_label)
+                                                        legend=legend_cfg, point_label=point_label,
+                                                        aerial_opacity=bg_alpha, streets=bg_streets)
                     st.session_state["rp_out"] = (point_id, png, pdf, "map" if is_full else "report")
             except Exception as e:
                 st.session_state.pop("rp_out", None)
