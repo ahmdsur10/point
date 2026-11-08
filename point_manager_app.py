@@ -1475,10 +1475,13 @@ def _rp_point_cached(pid):
     return get_point_full(pid)
 
 
+RP_ON_TOL, RP_NEAR_TOL = 3.0, 25.0  # ثوابت التحليل (بدون خيارات للمستخدم)
+
 with tab_report:
     st.subheader("📄 تقرير نقطة التجمع")
-    st.caption("اختر النقطة وارفع شبكة السيول (Shapefile ZIP أو GeoJSON)، وبيطلع تقرير بخريطة الصورة الجوية تقدر تحمله صورة أو PDF.")
+    st.caption("اختر النقطة وارفع شبكة السيول (Shapefile ZIP أو GeoJSON)، حدّد منظر الخريطة، ثم اختر شكل التقرير وحمّله صورة أو PDF.")
 
+    # ---- 1) النقطة ----
     rp_c1, rp_c2 = st.columns(2)
     with rp_c1:
         rp_id = st.number_input(f"رقم {PK_COLUMN}", min_value=0, step=1, value=0, key="rp_id")
@@ -1492,8 +1495,8 @@ with tab_report:
                                    format_func=lambda k: "—" if k is None else opts[k], key="rp_pick")
     point_id = int(rp_pick) if rp_pick else int(rp_id)
 
+    # ---- 2) الشبكة ----
     net_file = st.file_uploader("ملف شبكة السيول (ZIP شيب فايل أو GeoJSON)", type=pr.SUPPORTED_TYPES, key="rp_net")
-
     layer = None
     if net_file:
         try:
@@ -1502,7 +1505,7 @@ with tab_report:
             k1, k2 = st.columns(2)
             with k1:
                 if case_field:
-                    st.success(f"✅ {len(raw['features'])} عنصر — حقل الحالة: {case_field}")
+                    st.success(f"✅ {len(raw['features'])} عنصر — حقل النوع: {case_field}")
                 else:
                     case_field = st.selectbox("ما لقيت حقل اسمه case — اختر الحقل:", raw["fields"], key="rp_case_f")
             with k2:
@@ -1517,7 +1520,38 @@ with tab_report:
         except Exception as e:
             st.error(f"❌ {e}")
 
-    # ---- خريطة المعاينة: حدّد التكبير/التصغير والمنظر اللي تبيه بالتقرير ----
+    feats_all = []
+    if layer:
+        try:
+            feats_all = _prepare_cached(net_file.name, net_file.getvalue(), layer[1].to_wkt(), layer[2])
+        except Exception as e:
+            st.error(f"❌ تعذر تجهيز الشبكة: {e}")
+    cases = sorted({f["case"] for f in feats_all})
+    default_hex = pr.case_colors(feats_all) if feats_all else {}
+
+    # ---- 3) مفتاح الخريطة: نصوص + ألوان RGB ----
+    with st.expander("🏷️ مفتاح الخريطة (النصوص والألوان)", expanded=True):
+        point_label = st.text_input("نص نقطة التجمع في المفتاح", value="نقطة التجمع", key="rp_point_label",
+                                    help="مثال: نقطة تجمع سيول حي الياسمين")
+        legend_cfg = {}
+        if cases:
+            st.caption("لكل نوع شبكة: النص اللي يظهر في المفتاح + اللون (RGB من 0 إلى 255)")
+        for i, c in enumerate(cases):
+            hx = default_hex.get(c, "#00b0ff").lstrip("#")
+            r0, g0, b0 = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
+            kk = f"{net_file.name}_{i}"
+            c1, c2, c3, c4, c5 = st.columns([4, 1, 1, 1, 1])
+            lbl = c1.text_input(f"النص — النوع «{c}»", value=f"شبكة سيول: {c}", key=f"rp_lb_{kk}")
+            rr = c2.number_input("R", 0, 255, r0, 1, key=f"rp_r_{kk}")
+            gg = c3.number_input("G", 0, 255, g0, 1, key=f"rp_g_{kk}")
+            bb = c4.number_input("B", 0, 255, b0, 1, key=f"rp_b_{kk}")
+            col_hex = "#%02x%02x%02x" % (int(rr), int(gg), int(bb))
+            c5.markdown(
+                f"<div style='margin-top:1.9rem;height:2rem;border-radius:6px;border:1px solid #888;background:{col_hex}'></div>",
+                unsafe_allow_html=True)
+            legend_cfg[c] = {"label": lbl, "color": col_hex}
+
+    # ---- 4) خريطة المعاينة (التكبير والتصغير) ----
     rp_view = None
     prev_pt = None
     if point_id > 0:
@@ -1528,49 +1562,46 @@ with tab_report:
     if prev_pt and prev_pt.get("__lat") is not None:
         plat, plng = float(prev_pt["__lat"]), float(prev_pt["__lng"])
         st.markdown("#### 🔎 حدّد منظر الخريطة")
-        st.caption("كبّر / صغّر وحرّك الخريطة (صورة جوية) للمنظر اللي تبيه — التقرير يطلع بنفس مركز وعرض الخريطة اللي تشوفها هنا.")
+        st.caption("كبّر / صغّر وحرّك الخريطة للمنظر اللي تبيه — التقرير يطلع بنفس مركز وعرض الخريطة اللي تشوفها هنا.")
         pm = folium.Map(location=[plat, plng], zoom_start=18, max_zoom=19, tiles=None, control_scale=True)
         folium.TileLayer(
             "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
             attr="Esri World Imagery", name="صورة جوية", max_zoom=19,
         ).add_to(pm)
-        if layer:
-            try:
-                crs_wkt = layer[1].to_wkt()
-                pfeats = _prepare_cached(net_file.name, net_file.getvalue(), crs_wkt, layer[2])
-                pcolors = pr.case_colors(pfeats)
-                dl, dg = 0.012, 0.013
-                shown = 0
-                for pf in pfeats:
-                    b0, b1, b2, b3 = pf["geom_w"].bounds
-                    if b2 < plng - dg or b0 > plng + dg or b3 < plat - dl or b1 > plat + dl:
-                        continue
-                    folium.GeoJson(
-                        pr.mapping(pf["geom_w"]),
-                        style_function=lambda _x, c=pcolors[pf["case"]]: {"color": c, "weight": 4, "fillOpacity": 0.2},
-                        tooltip=pf["case"],
-                    ).add_to(pm)
-                    shown += 1
-                    if shown >= 600:
-                        break
-            except Exception as e:
-                st.warning(f"تعذر رسم الشبكة بالمعاينة: {e}")
+        if feats_all:
+            dl, dg, shown = 0.012, 0.013, 0
+            for pf in feats_all:
+                b0, b1, b2, b3 = pf["geom_w"].bounds
+                if b2 < plng - dg or b0 > plng + dg or b3 < plat - dl or b1 > plat + dl:
+                    continue
+                folium.GeoJson(
+                    pr.mapping(pf["geom_w"]),
+                    style_function=lambda _x, c=legend_cfg[pf["case"]]["color"]: {"color": c, "weight": 4, "fillOpacity": 0.2},
+                    tooltip=pf["case"],
+                ).add_to(pm)
+                shown += 1
+                if shown >= 600:
+                    break
         folium.CircleMarker([plat, plng], radius=9, color="white", weight=2, fill=True,
                             fill_color="#ff1744", fill_opacity=1, tooltip="نقطة التجمع").add_to(pm)
         prev_out = st_folium(pm, width="100%", height=480, returned_objects=["bounds"], key=f"rp_prev_{point_id}")
         if prev_out and prev_out.get("bounds"):
-            bb = prev_out["bounds"]
-            rp_view = (bb["_southWest"]["lat"], bb["_southWest"]["lng"],
-                       bb["_northEast"]["lat"], bb["_northEast"]["lng"])
+            bb_ = prev_out["bounds"]
+            rp_view = (bb_["_southWest"]["lat"], bb_["_southWest"]["lng"],
+                       bb_["_northEast"]["lat"], bb_["_northEast"]["lng"])
         else:
             st.caption("ℹ️ لو ما حركت الخريطة بيستخدم التقرير تكبير تلقائي مناسب.")
 
-    with st.expander("⚙️ إعدادات التحليل"):
-        e1, e2 = st.columns(2)
-        with e1:
-            on_tol = st.number_input("«على الخط» إذا المسافة ≤ (م)", 0.5, 50.0, 3.0, 0.5, key="rp_on")
-        with e2:
-            near_tol = st.number_input("«بجوار الخط» إذا المسافة ≤ (م)", 1.0, 500.0, 25.0, 1.0, key="rp_near")
+    # ---- 5) شكل التقرير ----
+    STYLE_FULL = "🗺️ خريطة كاملة (الصورة الجوية تملأ الصفحة + مفتاح فقط)"
+    STYLE_CLASSIC = "📄 التقرير الكامل (خريطة + عمود جانبي: الموضوع وعلاقة الشبكة)"
+    rp_style = st.radio("شكل التقرير", [STYLE_FULL, STYLE_CLASSIC], key="rp_style")
+    is_full = rp_style == STYLE_FULL
+    show_north = show_scale = False
+    if is_full:
+        o1, o2, _ = st.columns([1, 1, 3])
+        show_north = o1.checkbox("سهم الشمال", value=False, key="rp_north")
+        show_scale = o2.checkbox("مقياس الرسم", value=False, key="rp_scale")
 
     if st.button("📄 إنشاء التقرير", type="primary", key="rp_go"):
         if point_id <= 0:
@@ -1584,22 +1615,26 @@ with tab_report:
                     st.error("❌ هذي النقطة ما لها موقع مسجّل")
                 else:
                     with st.spinner("جاري إعداد التقرير وتحميل الصورة الجوية..."):
-                        feats = pr.prepare_layer(layer[0], layer[1], layer[2], TABLE_SRID) if layer else []
-                        an = pr.analyze_point(float(row["__lat"]), float(row["__lng"]), feats,
-                                              on_tol, max(near_tol, on_tol), TABLE_SRID)
-                        png, pdf = pr.render_report(an, point_id, row.get("وصف_الموقع") or "", view=rp_view)
-                    st.session_state["rp_out"] = (point_id, png, pdf)
+                        an = pr.analyze_point(float(row["__lat"]), float(row["__lng"]), feats_all,
+                                              RP_ON_TOL, RP_NEAR_TOL, TABLE_SRID)
+                        if is_full:
+                            png, pdf = pr.render_full_map(an, view=rp_view, legend=legend_cfg, point_label=point_label,
+                                                          show_north=show_north, show_scale=show_scale)
+                        else:
+                            png, pdf = pr.render_report(an, point_id, row.get("وصف_الموقع") or "", view=rp_view,
+                                                        legend=legend_cfg, point_label=point_label)
+                    st.session_state["rp_out"] = (point_id, png, pdf, "map" if is_full else "report")
             except Exception as e:
                 st.session_state.pop("rp_out", None)
                 st.error(f"❌ تعذر إنشاء التقرير: {e}")
 
     if st.session_state.get("rp_out"):
-        pid, png, pdf = st.session_state["rp_out"]
+        pid, png, pdf, kind = st.session_state["rp_out"]
         d1, d2, _ = st.columns([1, 1, 2])
         with d1:
-            st.download_button("🖼️ تحميل صورة PNG", png, file_name=f"point_{pid}_report.png", mime="image/png",
+            st.download_button("🖼️ تحميل صورة PNG", png, file_name=f"point_{pid}_{kind}.png", mime="image/png",
                                use_container_width=True, key="rp_dl_png")
         with d2:
-            st.download_button("📕 تحميل PDF", pdf, file_name=f"point_{pid}_report.pdf", mime="application/pdf",
+            st.download_button("📕 تحميل PDF", pdf, file_name=f"point_{pid}_{kind}.pdf", mime="application/pdf",
                                use_container_width=True, key="rp_dl_pdf")
         st.image(png, use_container_width=True)
