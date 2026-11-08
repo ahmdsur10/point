@@ -482,7 +482,9 @@ def _tile_crop(url, lat, lng, z, half_w, half_h):
     return crop, (x0, y0), ok > 0
 
 
-def _aerial_background(lat, lng, radius_m, aspect):
+def _aerial_background(lat, lng, radius_m, aspect, opacity=1.0, streets=False):
+    """خلفية الخريطة: صورة جوية فوق خريطة شوارع (OSM) أو فوق الأبيض.
+    opacity = عتامة الصورة الجوية (1 = معتمة تمامًا، 0 = شفافة تمامًا فتظهر الشوارع فقط)."""
     z = int(math.floor(math.log2(156543.03 * math.cos(math.radians(lat)) * 1500 / (2 * radius_m))))
     z = max(1, min(19, z))
     mpp = 156543.03 * math.cos(math.radians(lat)) / 2 ** z
@@ -491,7 +493,26 @@ def _aerial_background(lat, lng, radius_m, aspect):
     # لمسة باهتة قليلًا (مثل خرائط ArcGIS) عشان الخطوط تبان أوضح
     crop = ImageEnhance.Color(crop).enhance(0.75)
     crop = Image.blend(crop, Image.new("RGB", crop.size, (255, 255, 255)), 0.16)
+    opacity = max(0.0, min(1.0, float(opacity)))
+    if opacity < 0.999:
+        base = None
+        if streets:
+            base, _, ok_osm = _tile_crop(OSM_TILES, lat, lng, z, hw, hw / aspect)
+            if not ok_osm:
+                base = None
+            elif base.size != crop.size:
+                base = base.resize(crop.size)
+        if base is None:
+            base = Image.new("RGB", crop.size, (255, 255, 255))
+        crop = Image.blend(base, crop, opacity)
     return crop, origin, z, mpp, ok
+
+
+def _attribution(streets, opacity):
+    t = "Esri World Imagery"
+    if streets and opacity < 0.999:
+        t += "  |  © OpenStreetMap contributors"
+    return t
 
 
 def _parts(g):
@@ -613,14 +634,14 @@ def _draw_map_legend(fig, ax, point_label, items, fontsize=11.5):
 
 
 def render_full_map(analysis, dpi=200, view=None, legend=None, point_label="نقطة التجمع",
-                    show_north=False, show_scale=False):
+                    show_north=False, show_scale=False, aerial_opacity=1.0, streets=False):
     """خريطة بالصورة الجوية تملأ كامل الصورة (A4 أفقي) + مفتاح خريطة فقط. يرجع (png, pdf)."""
     lat, lng = analysis["lat"], analysis["lng"]
     feats = analysis["features"]
     colors, labels = _legend_maps(feats, legend)
     W_IN, H_IN = 11.69, 8.27
     clat, clng, radius = _view_params(analysis, view)
-    bg, (ox, oy), z, mpp, tiles_ok = _aerial_background(clat, clng, radius, W_IN / H_IN)
+    bg, (ox, oy), z, mpp, tiles_ok = _aerial_background(clat, clng, radius, W_IN / H_IN, aerial_opacity, streets)
     dlat_v = radius * 2 / 111320.0
     dlng_v = dlat_v / max(math.cos(math.radians(clat)), 0.2)
 
@@ -642,7 +663,7 @@ def render_full_map(analysis, dpi=200, view=None, legend=None, point_label="نق
     cx, cy = xy(lng, lat)
     ax.scatter([cx], [cy], s=130, color="#e60000", edgecolor="white", linewidth=1.8, zorder=8)
 
-    ax.text(0.006, 0.006, "Esri World Imagery", transform=ax.transAxes, ha="left", va="bottom", fontsize=6.5,
+    ax.text(0.006, 0.006, _attribution(streets, aerial_opacity), transform=ax.transAxes, ha="left", va="bottom", fontsize=6.5,
             color="white", path_effects=[pe.withStroke(linewidth=2, foreground="#444444")], zorder=10)
 
     if show_north:
@@ -677,7 +698,8 @@ def render_full_map(analysis, dpi=200, view=None, legend=None, point_label="نق
 
 
 
-def render_report(analysis, point_id, description, dpi=200, view=None, legend=None, point_label="نقطة التجمع"):
+def render_report(analysis, point_id, description, dpi=200, view=None, legend=None, point_label="نقطة التجمع",
+                  aerial_opacity=1.0, streets=False):
     """يرجع (png_bytes, pdf_bytes): صفحة A4 أفقية على نمط خرائط ArcGIS:
     خريطة جوية كبيرة + عمود جانبي (خريطة موقع عامة، المصطلحات، الموضوع، علاقة الشبكة، مقياس الرسم)."""
     lat, lng = analysis["lat"], analysis["lng"]
@@ -696,7 +718,7 @@ def render_report(analysis, point_id, description, dpi=200, view=None, legend=No
     else:
         clat, clng = lat, lng
         radius = max(120.0, min((near or 0) * 1.3, 600.0), analysis["near_tol"] * 3)
-    bg, (ox, oy), z, mpp, tiles_ok = _aerial_background(clat, clng, radius, aspect)
+    bg, (ox, oy), z, mpp, tiles_ok = _aerial_background(clat, clng, radius, aspect, aerial_opacity, streets)
     dlat_v = radius * 2 / 111320.0
     dlng_v = dlat_v / max(math.cos(math.radians(clat)), 0.2)
 
@@ -739,7 +761,7 @@ def render_report(analysis, point_id, description, dpi=200, view=None, legend=No
     ax.annotate("", xy=(0.955, 0.935), xytext=(0.955, 0.865), xycoords="axes fraction",
                 arrowprops=dict(arrowstyle="-|>", color="black", lw=2), zorder=10)
     ax.text(0.955, 0.84, "N", transform=ax.transAxes, ha="center", va="center", fontsize=10, fontweight="bold", zorder=10)
-    ax.text(0.99, 0.012, "Esri World Imagery", transform=ax.transAxes, ha="right", fontsize=6.5, color="white",
+    ax.text(0.99, 0.012, _attribution(streets, aerial_opacity), transform=ax.transAxes, ha="right", fontsize=6.5, color="white",
             path_effects=[pe.withStroke(linewidth=2, foreground="#444444")], zorder=10)
 
     # ================= العمود الجانبي =================
