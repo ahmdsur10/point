@@ -20,6 +20,8 @@
 import re
 import io
 import zipfile
+import math
+import html
 
 import streamlit as st
 import pandas as pd
@@ -1476,6 +1478,61 @@ def _rp_point_cached(pid):
 
 
 RP_ON_TOL, RP_NEAR_TOL = 3.0, 25.0  # ثوابت التحليل (بدون خيارات للمستخدم)
+RP_ASPECT_FULL = 11.69 / 8.27                       # نسبة عرض/ارتفاع الخريطة في "الخريطة الكاملة"
+RP_ASPECT_CLASSIC = (0.76 * 11.69) / (0.94 * 8.27)  # نسبة الخريطة في "التقرير الكامل"
+RP_W_MIN, RP_W_MAX = 100, 3000                      # عرض الخريطة بالمتر
+
+
+def _rp_zoom(wkey, factor):
+    w = st.session_state.get(wkey, 300) * factor
+    st.session_state[wkey] = int(round(min(RP_W_MAX, max(RP_W_MIN, w)) / 10.0) * 10)
+
+
+def _rp_move(wkey, dxkey, dykey, fx, fy):
+    w = st.session_state.get(wkey, 300)
+    st.session_state[dxkey] = st.session_state.get(dxkey, 0.0) + fx * w * 0.25
+    st.session_state[dykey] = st.session_state.get(dykey, 0.0) + fy * w * 0.25
+
+
+def _rp_recenter(dxkey, dykey):
+    st.session_state[dxkey] = 0.0
+    st.session_state[dykey] = 0.0
+
+
+def _rp_preview_html(plat, plng, view, feats, legend_cfg, streets, alpha, aspect, max_w=760):
+    """معاينة ثابتة (بدون تفاعل) بنفس الإطار والخلفية اللي بيطلع فيها التقرير — ما تسبب إعادة تشغيل للصفحة."""
+    s_, w_, n_, e_ = view
+    m = folium.Map(location=[(s_ + n_) / 2, (w_ + e_) / 2], zoom_start=17, max_zoom=19, tiles=None,
+                   zoom_control=False, dragging=False, scrollWheelZoom=False, zoom_snap=0,
+                   double_click_zoom=False, box_zoom=False, touch_zoom=False, keyboard=False,
+                   attribution_control=False)
+    m.get_root().header.add_child(folium.Element("<style>.leaflet-container{background:#fff}</style>"))
+    if streets:
+        folium.TileLayer("OpenStreetMap", max_zoom=19).add_to(m)
+    folium.TileLayer(
+        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri World Imagery", max_zoom=19, opacity=alpha,
+    ).add_to(m)
+    shown = 0
+    for pf in feats:
+        b0, b1, b2, b3 = pf["geom_w"].bounds
+        if b2 < w_ or b0 > e_ or b3 < s_ or b1 > n_:
+            continue
+        col = legend_cfg.get(pf["case"], {}).get("color", "#00b0ff")
+        folium.GeoJson(pr.mapping(pf["geom_w"]),
+                       style_function=lambda _x, c=col: {"color": c, "weight": 4, "fillOpacity": 0.2}).add_to(m)
+        shown += 1
+        if shown >= 800:
+            break
+    folium.CircleMarker([plat, plng], radius=7, color="white", weight=2, fill=True,
+                        fill_color="#e60000", fill_opacity=1).add_to(m)
+    m.fit_bounds([[s_, w_], [n_, e_]], max_zoom=19)
+    inner = m.get_root().render()
+    outer = (f"<div style='width:min(100%,{max_w}px);aspect-ratio:{aspect:.4f}/1;margin:auto;"
+             f"border:2px solid #0b4f9e;border-radius:6px;overflow:hidden'>"
+             f"<iframe srcdoc=\"{html.escape(inner, quote=True)}\" style='width:100%;height:100%;border:0'></iframe></div>")
+    return outer, int(max_w / aspect) + 12
+
 
 with tab_report:
     st.subheader("📄 تقرير نقطة التجمع")
@@ -1551,7 +1608,7 @@ with tab_report:
                 unsafe_allow_html=True)
             legend_cfg[c] = {"label": lbl, "color": col_hex}
 
-    # ---- خلفية الخريطة: الصورة الجوية + الشوارع + الشفافية ----
+    # ---- 4) خلفية الخريطة: الصورة الجوية + الشوارع + الشفافية ----
     with st.expander("🖼️ خلفية الخريطة (الصورة الجوية + أسماء الشوارع)", expanded=True):
         bg_streets = st.checkbox("إظهار خريطة الشوارع بأسمائها تحت الصورة الجوية", value=True, key="rp_streets")
         bg_transp = st.slider("شفافية الصورة الجوية", 0, 100, 40, 5, format="%d%%", key="rp_transp",
@@ -1559,56 +1616,6 @@ with tab_report:
         if bg_streets and bg_transp == 0:
             st.caption("ℹ️ الصورة معتمة بالكامل، فأسماء الشوارع ما راح تظهر — زِد الشفافية.")
     bg_alpha = 1.0 - bg_transp / 100.0
-
-    # ---- 4) خريطة المعاينة (التكبير والتصغير) ----
-    rp_view = None
-    prev_pt = None
-    if point_id > 0:
-        try:
-            prev_pt = _rp_point_cached(point_id)
-        except Exception as e:
-            st.error(f"❌ {e}")
-    if prev_pt and prev_pt.get("__lat") is not None:
-        plat, plng = float(prev_pt["__lat"]), float(prev_pt["__lng"])
-        st.markdown("#### 🔎 حدّد منظر الخريطة")
-        st.caption("كبّر / صغّر وحرّك الخريطة للمنظر اللي تبيه — التقرير يطلع بنفس مركز وعرض الخريطة اللي تشوفها هنا.")
-        pm = folium.Map(location=[plat, plng], zoom_start=18, max_zoom=19, tiles=None, control_scale=True)
-        if bg_streets:
-            folium.TileLayer("OpenStreetMap", name="الشوارع", max_zoom=19).add_to(pm)
-        folium.TileLayer(
-            "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-            attr="Esri World Imagery", name="صورة جوية", max_zoom=19, opacity=bg_alpha,
-        ).add_to(pm)
-        if feats_all:
-            dl, dg, shown = 0.012, 0.013, 0
-            for pf in feats_all:
-                b0, b1, b2, b3 = pf["geom_w"].bounds
-                if b2 < plng - dg or b0 > plng + dg or b3 < plat - dl or b1 > plat + dl:
-                    continue
-                folium.GeoJson(
-                    pr.mapping(pf["geom_w"]),
-                    style_function=lambda _x, c=legend_cfg[pf["case"]]["color"]: {"color": c, "weight": 4, "fillOpacity": 0.2},
-                    tooltip=pf["case"],
-                ).add_to(pm)
-                shown += 1
-                if shown >= 600:
-                    break
-        folium.CircleMarker([plat, plng], radius=9, color="white", weight=2, fill=True,
-                            fill_color="#ff1744", fill_opacity=1, tooltip="نقطة التجمع").add_to(pm)
-        cz_key = f"rp_cz_{point_id}"
-        cz_kw = {}
-        if st.session_state.get(cz_key):  # نحافظ على التكبير/المنظر لما تغيّر الشفافية أو الألوان
-            cz_kw = {"center": st.session_state[cz_key][0], "zoom": st.session_state[cz_key][1]}
-        prev_out = st_folium(pm, width="100%", height=480, returned_objects=["bounds", "center", "zoom"],
-                             key=f"rp_prev_{point_id}", **cz_kw)
-        if prev_out and prev_out.get("center") and prev_out.get("zoom") is not None:
-            st.session_state[cz_key] = ([prev_out["center"]["lat"], prev_out["center"]["lng"]], prev_out["zoom"])
-        if prev_out and prev_out.get("bounds"):
-            bb_ = prev_out["bounds"]
-            rp_view = (bb_["_southWest"]["lat"], bb_["_southWest"]["lng"],
-                       bb_["_northEast"]["lat"], bb_["_northEast"]["lng"])
-        else:
-            st.caption("ℹ️ لو ما حركت الخريطة بيستخدم التقرير تكبير تلقائي مناسب.")
 
     # ---- 5) شكل التقرير ----
     STYLE_FULL = "🗺️ خريطة كاملة (الصورة الجوية تملأ الصفحة + مفتاح فقط)"
@@ -1620,6 +1627,52 @@ with tab_report:
         o1, o2, _ = st.columns([1, 1, 3])
         show_north = o1.checkbox("سهم الشمال", value=False, key="rp_north")
         show_scale = o2.checkbox("مقياس الرسم", value=False, key="rp_scale")
+
+    # ---- 6) منظر الخريطة (تكبير / تصغير / تحريك) — معاينة ثابتة بدون إعادة تشغيل ----
+    rp_view = None
+    prev_pt = None
+    if point_id > 0:
+        try:
+            prev_pt = _rp_point_cached(point_id)
+        except Exception as e:
+            st.error(f"❌ {e}")
+    if prev_pt and prev_pt.get("__lat") is not None:
+        plat, plng = float(prev_pt["__lat"]), float(prev_pt["__lng"])
+        wkey, dxkey, dykey = f"rp_w_{point_id}", f"rp_dx_{point_id}", f"rp_dy_{point_id}"
+        if wkey not in st.session_state:
+            st.session_state[wkey] = 300
+        st.session_state.setdefault(dxkey, 0.0)
+        st.session_state.setdefault(dykey, 0.0)
+
+        st.markdown("#### 🔎 حدّد منظر الخريطة")
+        st.caption("المعاينة تعرض بالضبط الإطار اللي بيطلع في التقرير. تحكّم بالتكبير والتحريك من الأزرار تحت.")
+        b = st.columns([1, 1, 1, 1, 1, 1, 1])
+        b[0].button("➕ تكبير", on_click=_rp_zoom, args=(wkey, 0.7), key="rp_zin", use_container_width=True)
+        b[1].button("➖ تصغير", on_click=_rp_zoom, args=(wkey, 1 / 0.7), key="rp_zout", use_container_width=True)
+        b[2].button("⬆️ شمال", on_click=_rp_move, args=(wkey, dxkey, dykey, 0, 1), key="rp_mn", use_container_width=True)
+        b[3].button("⬇️ جنوب", on_click=_rp_move, args=(wkey, dxkey, dykey, 0, -1), key="rp_ms", use_container_width=True)
+        b[4].button("⬅️ غرب", on_click=_rp_move, args=(wkey, dxkey, dykey, -1, 0), key="rp_mw", use_container_width=True)
+        b[5].button("➡️ شرق", on_click=_rp_move, args=(wkey, dxkey, dykey, 1, 0), key="rp_me", use_container_width=True)
+        b[6].button("🎯 توسيط", on_click=_rp_recenter, args=(dxkey, dykey), key="rp_rc", use_container_width=True)
+        st.slider("عرض الخريطة (متر)", RP_W_MIN, RP_W_MAX, step=10, key=wkey,
+                  help="كل ما قلّ الرقم كان التكبير أكبر")
+
+        width_m = float(st.session_state[wkey])
+        clat = plat + st.session_state[dykey] / 111320.0
+        clng = plng + st.session_state[dxkey] / (111320.0 * max(math.cos(math.radians(plat)), 0.2))
+        aspect = RP_ASPECT_FULL if is_full else RP_ASPECT_CLASSIC
+        half_w = width_m / 2.0
+        half_h = half_w / aspect
+        dlat = half_h / 111320.0
+        dlng = half_w / (111320.0 * max(math.cos(math.radians(clat)), 0.2))
+        rp_view = (clat - dlat, clng - dlng, clat + dlat, clng + dlng)
+        try:
+            prev_html, prev_h = _rp_preview_html(plat, plng, rp_view, feats_all, legend_cfg, bg_streets, bg_alpha, aspect)
+            components.html(prev_html, height=prev_h)
+        except Exception as e:
+            st.warning(f"تعذر عرض المعاينة (التقرير ممكن ينشأ عادي): {e}")
+    elif point_id > 0:
+        st.info("ℹ️ هذي النقطة ما لها موقع مسجّل أو غير موجودة.")
 
     if st.button("📄 إنشاء التقرير", type="primary", key="rp_go"):
         if point_id <= 0:
