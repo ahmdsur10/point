@@ -22,6 +22,7 @@ import io
 import zipfile
 import math
 import html
+import datetime as _dt
 
 import streamlit as st
 import pandas as pd
@@ -1551,6 +1552,12 @@ with tab_report:
             rp_pick = st.selectbox("أو اختر من نتائج البحث", [None] + list(opts.keys()),
                                    format_func=lambda k: "—" if k is None else opts[k], key="rp_pick")
     point_id = int(rp_pick) if rp_pick else int(rp_id)
+    prev_pt = None
+    if point_id > 0:
+        try:
+            prev_pt = _rp_point_cached(point_id)
+        except Exception as e:
+            st.error(f"❌ {e}")
 
     # ---- 2) الشبكة ----
     net_file = st.file_uploader("ملف شبكة السيول (ZIP شيب فايل أو GeoJSON)", type=pr.SUPPORTED_TYPES, key="rp_net")
@@ -1628,14 +1635,21 @@ with tab_report:
         show_north = o1.checkbox("سهم الشمال", value=False, key="rp_north")
         show_scale = o2.checkbox("مقياس الرسم", value=False, key="rp_scale")
 
+    # ---- عنوان التقرير + الإفادة ----
+    style_key = "full" if is_full else "classic"
+    st.markdown("#### ✍️ عنوان التقرير والإفادة")
+    rp_title = st.text_input("عنوان التقرير (يظهر أعلى الصفحة — اتركه فاضي لو ما تبي عنوان)",
+                             key=f"rp_title_{point_id}", placeholder="مثال: نقطة تجمع سيول — شارع كذا مع طريق كذا")
+    stmt_key = f"rp_stmt_{point_id}"
+    if stmt_key not in st.session_state:  # نعبّيها من الحلول المقترحة المسجّلة بالقاعدة (وتقدر تعدّلها)
+        st.session_state[stmt_key] = str((prev_pt or {}).get("الحلول_المقترحة") or "")
+    rp_stmt = st.text_area("الإفادة / الحلول المقترحة (تظهر تحت الخريطة وبرّتها — اتركها فاضية لو ما تبيها)",
+                           key=stmt_key, height=150)
+    if pr.statement_overflow(style_key, rp_stmt):
+        st.warning("⚠️ الإفادة أطول من اللي يتسع بالصفحة (حوالي 8 أسطر) — راح تُقصّ في التقرير، وتبقى كاملة في جدول Excel.")
+
     # ---- 6) منظر الخريطة (تكبير / تصغير / تحريك) — معاينة ثابتة بدون إعادة تشغيل ----
     rp_view = None
-    prev_pt = None
-    if point_id > 0:
-        try:
-            prev_pt = _rp_point_cached(point_id)
-        except Exception as e:
-            st.error(f"❌ {e}")
     if prev_pt and prev_pt.get("__lat") is not None:
         plat, plng = float(prev_pt["__lat"]), float(prev_pt["__lng"])
         wkey, dxkey, dykey = f"rp_w_{point_id}", f"rp_dx_{point_id}", f"rp_dy_{point_id}"
@@ -1645,7 +1659,7 @@ with tab_report:
         st.session_state.setdefault(dykey, 0.0)
 
         st.markdown("#### 🔎 حدّد منظر الخريطة")
-        st.caption("المعاينة تعرض بالضبط الإطار اللي بيطلع في التقرير. تحكّم بالتكبير والتحريك من الأزرار تحت.")
+        st.caption("المعاينة تعرض بالضبط إطار الخريطة اللي بيطلع في التقرير (العنوان والإفادة خارجها). تحكّم بالتكبير والتحريك من الأزرار تحت.")
         b = st.columns([1, 1, 1, 1, 1, 1, 1])
         b[0].button("➕ تكبير", on_click=_rp_zoom, args=(wkey, 0.7), key="rp_zin", use_container_width=True)
         b[1].button("➖ تصغير", on_click=_rp_zoom, args=(wkey, 1 / 0.7), key="rp_zout", use_container_width=True)
@@ -1660,7 +1674,7 @@ with tab_report:
         width_m = float(st.session_state[wkey])
         clat = plat + st.session_state[dykey] / 111320.0
         clng = plng + st.session_state[dxkey] / (111320.0 * max(math.cos(math.radians(plat)), 0.2))
-        aspect = RP_ASPECT_FULL if is_full else RP_ASPECT_CLASSIC
+        aspect = pr.layout_aspect(style_key, rp_title, rp_stmt)
         half_w = width_m / 2.0
         half_h = half_w / aspect
         dlat = half_h / 111320.0
@@ -1691,12 +1705,34 @@ with tab_report:
                         if is_full:
                             png, pdf = pr.render_full_map(an, view=rp_view, legend=legend_cfg, point_label=point_label,
                                                           show_north=show_north, show_scale=show_scale,
-                                                          aerial_opacity=bg_alpha, streets=bg_streets)
+                                                          aerial_opacity=bg_alpha, streets=bg_streets,
+                                                          title=rp_title, statement=rp_stmt)
                         else:
                             png, pdf = pr.render_report(an, point_id, row.get("وصف_الموقع") or "", view=rp_view,
                                                         legend=legend_cfg, point_label=point_label,
-                                                        aerial_opacity=bg_alpha, streets=bg_streets)
+                                                        aerial_opacity=bg_alpha, streets=bg_streets,
+                                                        title=rp_title, statement=rp_stmt)
                     st.session_state["rp_out"] = (point_id, png, pdf, "map" if is_full else "report")
+                    # ---- نضيف التقرير لسجل جدول Excel ----
+                    _lat, _lng = float(row["__lat"]), float(row["__lng"])
+                    _loc = " — ".join(str(x).strip() for x in (row.get("اسم_الشارع"), row.get("وصف_الموقع"))
+                                      if x not in (None, "") and str(x).strip())
+                    _uni = row.get("الرقم_الموحد")
+                    entry = {
+                        "point_id": point_id, "title": (rp_title or "").strip(),
+                        "unified": "" if _uni in (None, "") else str(_uni), "location": _loc,
+                        "coords": f"{_lat:.6f}, {_lng:.6f}",
+                        "url": f"https://www.google.com/maps?q={_lat:.6f},{_lng:.6f}",
+                        "statement": (rp_stmt or "").strip(),
+                        "date": _dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    }
+                    log = st.session_state.setdefault("rp_log", [])
+                    for i_, old_ in enumerate(log):
+                        if old_["point_id"] == point_id:
+                            log[i_] = entry
+                            break
+                    else:
+                        log.append(entry)
             except Exception as e:
                 st.session_state.pop("rp_out", None)
                 st.error(f"❌ تعذر إنشاء التقرير: {e}")
@@ -1711,3 +1747,42 @@ with tab_report:
             st.download_button("📕 تحميل PDF", pdf, file_name=f"point_{pid}_{kind}.pdf", mime="application/pdf",
                                use_container_width=True, key="rp_dl_pdf")
         st.image(png, use_container_width=True)
+
+
+    # ---- جدول التقارير (Excel) ----
+    st.markdown("---")
+    st.markdown("#### 📊 جدول التقارير (Excel)")
+    st.caption("كل تقرير تنشئه يُضاف هنا (الموقع + الرقم الموحد + العنوان + الإفادة). حمّل الجدول متى ما بغيت. "
+               "الجدول يُحفظ أثناء الجلسة فقط — لو بتكمل عليه لاحقًا ارفع الملف اللي حمّلته قبل.")
+    prev_xlsx = st.file_uploader("📎 ارفع جدول سابق لإكمال عليه (اختياري)", type=["xlsx"], key="rp_xlsx_up")
+    if prev_xlsx is not None:
+        marker = (prev_xlsx.name, prev_xlsx.size)
+        if st.session_state.get("rp_xlsx_marker") != marker:
+            try:
+                old_rows = pr.parse_reports_xlsx(prev_xlsx.getvalue())
+                log = st.session_state.setdefault("rp_log", [])
+                have = {r_["point_id"] for r_ in log}
+                added = [r_ for r_ in old_rows if r_["point_id"] not in have]
+                log[:0] = added  # القديمة أولًا
+                st.session_state["rp_xlsx_marker"] = marker
+                st.success(f"✅ تمت إضافة {len(added)} تقرير من الجدول السابق")
+            except Exception as e:
+                st.error(f"❌ تعذر قراءة الجدول: {e}")
+    rp_log = st.session_state.get("rp_log", [])
+    if rp_log:
+        df_log = pd.DataFrame([{
+            "م": i + 1, "رقم النقطة": r_["point_id"], "العنوان": r_["title"], "الرقم الموحد": r_["unified"],
+            "الموقع": r_["location"], "الإفادة": r_["statement"], "التاريخ": r_["date"]} for i, r_ in enumerate(rp_log)])
+        st.dataframe(df_log, use_container_width=True, hide_index=True)
+        x1, x2, _ = st.columns([1.3, 1, 2])
+        with x1:
+            st.download_button("📥 تحميل جدول Excel", pr.build_reports_xlsx(rp_log),
+                               file_name="point_reports.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               use_container_width=True, key="rp_dl_xlsx", type="primary")
+        with x2:
+            if st.button("🗑️ مسح الجدول", use_container_width=True, key="rp_log_clear"):
+                st.session_state["rp_log"] = []
+                st.rerun()
+    else:
+        st.info("لسا ما أنشأت أي تقرير — بعد أول تقرير يظهر الجدول هنا.")
