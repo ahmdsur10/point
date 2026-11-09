@@ -372,18 +372,29 @@ def prepare_layer(raw, crs, case_field, metric_epsg=20438):
     return out
 
 
+CASE_BLUE = "#005ce6"    # خطوط تصريف سيول منفذة       RGB(0, 92, 230)
+CASE_GREEN = "#70a800"   # خطوط تصريف سيول مستقبلية    RGB(112, 168, 0)
+
+
+def _default_case_color(case):
+    t = re.sub(r"\s+", " ", str(case)).strip()
+    if "غير" in t:
+        return None
+    if "منفذ" in t:
+        return CASE_BLUE
+    if "مستقبل" in t:   # مستقبلية مصممة / مستقبلية مصممة 2024-2025 ...
+        return CASE_GREEN
+    return None
+
+
 def case_colors(features):
+    """لون كل نوع (case): منفذة = أزرق (0,92,230) — مستقبلية = أخضر (112,168,0) — غيرها من لوحة ألوان."""
     cases = sorted({f["case"] for f in features})
-    colors, used = {}, set()
+    colors = {c: _default_case_color(c) for c in cases}
+    used = {v for v in colors.values() if v}
+    free = [p_ for p_ in PALETTE if p_ not in used and p_ not in (CASE_BLUE, CASE_GREEN)]
     for c in cases:
-        st = normalize_status(c)
-        pref = {"قائم": "#00b0ff", "تحت التنفيذ": "#ff9100", "مستقبلي / مقترح": "#d500f9"}.get(st)
-        if pref and pref not in used:
-            colors[c] = pref
-            used.add(pref)
-    free = [p for p in PALETTE if p not in used]
-    for c in cases:
-        if c not in colors:
+        if not colors[c]:
             colors[c] = free.pop(0) if free else "#90a4ae"
     return colors
 
@@ -543,7 +554,7 @@ def _hex_ok(c):
 def _legend_maps(feats, legend):
     """يدمج الألوان/النصوص المخصصة (legend: {case: {"label":..., "color":"#rrggbb"}}) مع الافتراضي."""
     colors = case_colors(feats)
-    labels = {c: f"شبكة سيول: {c}" for c in colors}
+    labels = {c: str(c) for c in colors}
     for c, cfg in (legend or {}).items():
         if not isinstance(cfg, dict):
             continue
@@ -833,6 +844,129 @@ def parse_reports_xlsx(data: bytes):
         out.append({"point_id": pid, "title": v("العنوان"), "unified": v("الرقم الموحد"), "location": v("الموقع"),
                     "coords": v("الإحداثيات"), "url": str(url), "statement": v("الإفادة"), "date": v("تاريخ التقرير")})
     return out
+
+
+
+# =========================================================
+# مكوّن خريطة المعاينة (تكبير/تصغير بالفأرة) — يشتغل داخل Streamlit كمكوّن ثنائي الاتجاه
+# يرسل لبايثون المنظر (bounds) فقط لما المستخدم يحرّك الخريطة، وما يعيد رسم نفسه مع كل تشغيل للصفحة.
+# =========================================================
+MAP_COMPONENT_VERSION = "v4"
+MAP_COMPONENT_HTML = r"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">
+<style>
+ html,body{margin:0;padding:0;background:transparent;font-family:Tahoma,Arial,sans-serif}
+ #wrap{position:relative;width:100%;box-sizing:border-box;border:2px solid #0b4f9e;border-radius:8px;overflow:hidden;background:#fff}
+ #map{position:absolute;inset:0;background:#fff;cursor:grab}
+ #map:active{cursor:grabbing}
+ .tag{position:absolute;z-index:1000;pointer-events:none;background:rgba(255,255,255,.88);border-radius:6px;
+      padding:4px 9px;font-size:12px;color:#12304f;box-shadow:0 1px 4px rgba(0,0,0,.3);direction:rtl}
+ #hint{top:8px;right:8px}
+ #wid{bottom:8px;right:8px;direction:ltr}
+ #attr{bottom:8px;left:8px;font-size:10px;padding:2px 6px;direction:ltr}
+</style></head>
+<body>
+<div id="wrap"><div id="map"></div>
+ <div id="hint" class="tag">🖱️ عجلة الفأرة: تكبير / تصغير &nbsp;•&nbsp; اسحب: تحريك الخريطة</div>
+ <div id="wid" class="tag"></div><div id="attr" class="tag"></div></div>
+<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const SL = {
+  ready(){ parent.postMessage({isStreamlitMessage:true,type:"streamlit:componentReady",apiVersion:1},"*"); },
+  height(h){ parent.postMessage({isStreamlitMessage:true,type:"streamlit:setFrameHeight",height:h},"*"); },
+  value(v){ parent.postMessage({isStreamlitMessage:true,type:"streamlit:setComponentValue",value:v,dataType:"json"},"*"); }
+};
+const ESRI="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}";
+const OSM="https://tile.openstreetmap.org/{z}/{x}/{y}.png";
+const wrap=document.getElementById('wrap'), widEl=document.getElementById('wid'), attrEl=document.getElementById('attr');
+let map=null, inst=null, osm=null, aerial=null, marker=null, geo=null, halo=null, featSig=null;
+let args=null, ignoreUntil=0, timer=null, lastSent=null, lastH=0;
+
+function ignoreFor(ms){ ignoreUntil = Date.now()+ms; }
+function bnds(){ const b=map.getBounds(); return [b.getSouth(),b.getWest(),b.getNorth(),b.getEast()]; }
+function differs(a,b){ if(!a||!b) return true; for(let i=0;i<4;i++){ if(Math.abs(a[i]-b[i])>1e-7) return true; } return false; }
+function updateWidth(){
+  if(!map) return; const b=map.getBounds(), lat=(b.getSouth()+b.getNorth())/2;
+  const m=(b.getEast()-b.getWest())*111320*Math.cos(lat*Math.PI/180);
+  widEl.textContent = "عرض الإطار ≈ " + Math.round(m) + " م";
+}
+function sendIfChanged(){
+  if(!map) return; const b=bnds();
+  if(differs(b,lastSent)){ lastSent=b; SL.value({bounds:b, zoom:map.getZoom(), inst:inst}); }
+}
+function schedule(ms){ clearTimeout(timer); timer=setTimeout(sendIfChanged, ms); }
+
+function colorOf(c){ return (args.colors && args.colors[c]) || "#00b0ff"; }
+function buildFeatures(){
+  if(geo){ map.removeLayer(geo); geo=null; } if(halo){ map.removeLayer(halo); halo=null; }
+  const fc = args.features;
+  if(!fc || !fc.features || !fc.features.length) return;
+  halo = L.geoJSON(fc, {filter:f=>f.geometry.type!=="Point", interactive:false,
+          style:()=>({color:"#ffffff",weight:7,opacity:0.55,fill:false})}).addTo(map);
+  geo = L.geoJSON(fc, {interactive:false,
+          style:f=>({color:colorOf(f.properties.case),weight:4,opacity:1,fillColor:colorOf(f.properties.case),fillOpacity:0.2}),
+          pointToLayer:(f,ll)=>L.circleMarker(ll,{radius:6,color:"#fff",weight:1.5,fillColor:colorOf(f.properties.case),fillOpacity:1})}).addTo(map);
+  if(marker) marker.bringToFront();
+}
+function restyle(){ if(geo) geo.setStyle(f=>({color:colorOf(f.properties.case),weight:4,opacity:1,fillColor:colorOf(f.properties.case),fillOpacity:0.2})); }
+
+function initMap(a){
+  if(map){ map.remove(); map=null; }
+  document.getElementById('map').innerHTML="";
+  map = L.map('map',{zoomSnap:0, zoomDelta:0.5, wheelPxPerZoomLevel:110, wheelDebounceTime:15, maxZoom:19, minZoom:15,
+                     zoomControl:true, attributionControl:false, scrollWheelZoom:true, doubleClickZoom:true});
+  ignoreFor(1200);
+  map.fitBounds([[a.init_bounds[0],a.init_bounds[1]],[a.init_bounds[2],a.init_bounds[3]]],{animate:false,maxZoom:19});
+  osm = L.tileLayer(OSM,{maxZoom:19,maxNativeZoom:19,zIndex:1});
+  aerial = L.tileLayer(ESRI,{maxZoom:19,maxNativeZoom:19,zIndex:2});
+  aerial.addTo(map);
+  L.control.scale({imperial:false,position:"bottomleft"}).addTo(map);
+  marker = L.circleMarker([a.lat,a.lng],{radius:7,color:"#fff",weight:2,fillColor:"#e60000",fillOpacity:1}).addTo(map);
+  map.on("moveend", function(){ updateWidth(); if(Date.now()<ignoreUntil) return; schedule(350); });
+  inst=a.inst; featSig=null; lastSent=null;
+  setTimeout(sendIfChanged, 1300);   // نرسل المنظر الابتدائي مرة وحدة عشان بايثون يعرف الإطار الفعلي
+}
+
+function render(a){
+  args=a;
+  const w=Math.max(240, document.documentElement.clientWidth);
+  const h=Math.round(w/a.aspect);
+  wrap.style.height=h+"px"; SL.height(h+8);
+  if(!map || inst!==a.inst){ initMap(a); }
+  else if(h!==lastH){ ignoreFor(500); map.invalidateSize({pan:true,animate:false}); schedule(700); }
+  lastH=h;
+  aerial.setOpacity(a.alpha);
+  if(a.streets){ if(!map.hasLayer(osm)){ osm.addTo(map); } } else if(map.hasLayer(osm)){ map.removeLayer(osm); }
+  attrEl.textContent = "Esri World Imagery" + (a.streets && a.alpha<0.999 ? "  |  © OpenStreetMap contributors" : "");
+  if(featSig!==a.feat_sig){ buildFeatures(); featSig=a.feat_sig; } else { restyle(); }
+  updateWidth();
+}
+window.addEventListener("message", function(ev){
+  if(ev.data && ev.data.type==="streamlit:render"){ render(ev.data.args||{}); }
+});
+window.addEventListener("resize", function(){
+  if(!map||!args) return; const w=Math.max(240,document.documentElement.clientWidth), h=Math.round(w/args.aspect);
+  wrap.style.height=h+"px"; SL.height(h+8); ignoreFor(500); map.invalidateSize({pan:true,animate:false}); schedule(700);
+});
+SL.ready();
+</script></body></html>
+"""
+
+
+def ensure_map_component_dir():
+    """يكتب ملف المكوّن في مجلد مؤقت ويرجّع مساره (ما تحتاج ترفع أي ملفات إضافية)."""
+    d = os.path.join(tempfile.gettempdir(), f"rp_view_map_{MAP_COMPONENT_VERSION}")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "index.html")
+    try:
+        same = os.path.exists(path) and open(path, encoding="utf-8").read() == MAP_COMPONENT_HTML
+    except Exception:
+        same = False
+    if not same:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(MAP_COMPONENT_HTML)
+    return d
 
 
 
