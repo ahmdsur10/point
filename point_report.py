@@ -601,9 +601,9 @@ def _fig_to_png_pdf(fig, dpi):
     return png, pdf_buf.getvalue()
 
 
-def _draw_map_legend(fig, ax, point_label, items, fontsize=11.5):
+def _draw_map_legend(fig, ax, point_label, items, fontsize=11.5, ax_h_in=None):
     """مفتاح خريطة داخل الخريطة (أسفل اليمين): نقطة التجمع + أنواع الشبكة. items = [(label, color)]"""
-    h_in = fig.get_size_inches()[1]
+    h_in = ax_h_in or fig.get_size_inches()[1]
     step = (fontsize * 2.15 / 72) / h_in
     pad_y, pad_x = 0.016, 0.010
     sw_w = 0.04
@@ -633,21 +633,226 @@ def _draw_map_legend(fig, ax, point_label, items, fontsize=11.5):
                            alpha=0.93, edgecolor="#777777", linewidth=1.1, linestyle=(0, (4, 3)), zorder=12))
 
 
+# =========================================================
+# العنوان + الإفادة (برة الخريطة) + تخطيط الصفحة
+# =========================================================
+PAGE_W_IN, PAGE_H_IN = 11.69, 8.27
+STMT_MAX_LINES = 8
+STMT_LINE_STEP = 0.0285   # ارتفاع السطر (كنسبة من ارتفاع الصفحة)
+STMT_HEAD = 0.05
+STMT_PAD = 0.012
+
+
+def _wrap_all(text, width):
+    lines = []
+    for para in str(text or "").replace("\r", "").split("\n"):
+        para = para.strip()
+        if para:
+            lines += textwrap.wrap(para, width) or []
+    return lines
+
+
+def statement_overflow(style, statement):
+    """True لو الإفادة أطول من اللي يتسع في الصفحة."""
+    return len(_wrap_all(statement, 112 if style == "full" else 92)) > STMT_MAX_LINES
+
+
+def _layout(style, title, statement):
+    has_t = bool((title or "").strip())
+    lines = _wrap_all(statement, 112 if style == "full" else 92)
+    if len(lines) > STMT_MAX_LINES:
+        lines = lines[:STMT_MAX_LINES]
+        lines[-1] = lines[-1].rstrip() + " …"
+    sh = (STMT_HEAD + STMT_LINE_STEP * len(lines) + STMT_PAD) if lines else 0.0
+    if style == "full":
+        th = 0.085 if has_t else 0.0
+        if not has_t and not lines:
+            rect = (0.0, 0.0, 1.0, 1.0)
+        else:
+            mb = (0.012 + sh + 0.012) if lines else 0.0
+            rect = (0.0, mb, 1.0, 1.0 - th - mb)
+        title_rect = (0.0, 1.0 - th, 1.0, th) if has_t else None
+        stmt_rect = (0.012, 0.012, 0.976, sh) if lines else None
+        content_top, f = 1.0 - th, 1.0
+    else:
+        TOP, BOT = 0.97, 0.03
+        th = 0.075 if has_t else 0.0
+        content_top = TOP - th - (0.01 if has_t else 0.0)
+        mb = BOT + sh + (0.01 if lines else 0.0)
+        rect = (0.022, mb, 0.76, content_top - mb)
+        title_rect = (0.022, TOP - th, 0.958, th) if has_t else None
+        stmt_rect = (0.022, BOT, 0.76, sh) if lines else None
+        f = (content_top - BOT) / (TOP - BOT)
+    aspect = (rect[2] * PAGE_W_IN) / (rect[3] * PAGE_H_IN)
+    return {"rect": rect, "title_rect": title_rect, "stmt_rect": stmt_rect, "lines": lines,
+            "aspect": aspect, "content_top": content_top, "f": f}
+
+
+def layout_aspect(style, title="", statement=""):
+    """نسبة عرض/ارتفاع إطار الخريطة في التقرير (تستخدمها المعاينة في التطبيق)."""
+    return _layout(style, title, statement)["aspect"]
+
+
+def _draw_title_band(fig, rect, title):
+    x, y, w, h = rect
+    t = title.strip()
+    fig.add_artist(Rectangle((x, y), w, h, transform=fig.transFigure, facecolor="#0b4f9e", edgecolor="none", zorder=5))
+    fig.add_artist(Rectangle((x, y), w, 0.006, transform=fig.transFigure, facecolor="#2fa0e0", edgecolor="none", zorder=6))
+    fs = min(26, max(12, 26 * 42 / max(len(t), 1)))
+    fig.text(x + w / 2, y + h / 2 + 0.002, ar(t), color="white", fontsize=fs, fontweight="bold",
+             ha="center", va="center", zorder=7)
+
+
+def _draw_statement(fig, rect, lines):
+    x, y, w, h = rect
+    fig.add_artist(Rectangle((x, y), w, h, transform=fig.transFigure, facecolor="#fbfdff", edgecolor="#8a8a8a",
+                             linewidth=1.1, linestyle=(0, (4, 3)), zorder=5))
+    fig.add_artist(Rectangle((x + w - 0.006, y), 0.006, h, transform=fig.transFigure, facecolor="#0b4f9e",
+                             edgecolor="none", zorder=6))
+    xr = x + w - 0.016
+    fig.text(xr, y + h - 0.026, ar("الإفادة"), fontsize=14, color="#0b4f9e", fontweight="bold",
+             ha="right", va="center", zorder=7)
+    fig.add_artist(Line2D([x + 0.012, xr], [y + h - 0.047] * 2, transform=fig.transFigure, color="#9ccc65",
+                          lw=1.4, zorder=7))
+    ly = y + h - 0.047 - 0.022
+    for ln_ in lines:
+        fig.text(xr, ly, ar(ln_), fontsize=10.5, color="#222", ha="right", va="center", zorder=7)
+        ly -= STMT_LINE_STEP
+
+
+# =========================================================
+# جدول Excel (سجل التقارير)
+# =========================================================
+XLSX_HEADERS = ["م", "رقم النقطة", "العنوان", "الرقم الموحد", "الموقع", "الإحداثيات", "رابط الموقع", "الإفادة", "تاريخ التقرير"]
+_XLSX_KEYS = ["", "point_id", "title", "unified", "location", "coords", "url", "statement", "date"]
+_XLSX_WIDTHS = [6, 12, 34, 18, 40, 26, 18, 70, 18]
+
+
+def build_reports_xlsx(rows):
+    """يبني ملف Excel منسّق (RTL) من سجل التقارير. rows = [dict(point_id,title,unified,location,coords,url,statement,date)]"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "تقارير النقاط"
+    ws.sheet_view.rightToLeft = True
+    ws.sheet_view.showGridLines = False
+    ncol = len(XLSX_HEADERS)
+    thin = Side(style="thin", color="C9D6E6")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncol)
+    c = ws.cell(row=1, column=1, value="سجل تقارير نقاط التجمع")
+    c.font = Font(name="Cairo", size=18, bold=True, color="FFFFFF")
+    c.fill = PatternFill("solid", fgColor="0B4F9E")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 38
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=ncol)
+    c = ws.cell(row=2, column=1, value=f"عدد التقارير: {len(rows)}   —   تاريخ التصدير: {datetime.datetime.now():%Y-%m-%d %H:%M}")
+    c.font = Font(name="Cairo", size=10, color="2B4C7E")
+    c.fill = PatternFill("solid", fgColor="E3F0FB")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[2].height = 22
+
+    HR = 4
+    for j, (h, w) in enumerate(zip(XLSX_HEADERS, _XLSX_WIDTHS), 1):
+        cell = ws.cell(row=HR, column=j, value=h)
+        cell.font = Font(name="Cairo", size=11, bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="2FA0E0")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+        ws.column_dimensions[chr(64 + j)].width = w
+    ws.row_dimensions[HR].height = 28
+
+    for i, r in enumerate(rows, 1):
+        rr = HR + i
+        zebra = PatternFill("solid", fgColor="F2F8FD" if i % 2 == 0 else "FFFFFF")
+        for j, key in enumerate(_XLSX_KEYS, 1):
+            val = i if key == "" else r.get(key, "")
+            cell = ws.cell(row=rr, column=j, value=val if val is not None else "")
+            cell.font = Font(name="Cairo", size=10.5)
+            cell.fill = zebra
+            cell.border = border
+            center = key in ("", "point_id", "unified", "coords", "date", "url")
+            cell.alignment = Alignment(horizontal="center" if center else "right", vertical="center", wrap_text=True,
+                                       readingOrder=2)
+            if key == "url" and val:
+                cell.value = "فتح في قوقل ماب"
+                cell.hyperlink = str(val)
+                cell.font = Font(name="Cairo", size=10.5, color="0563C1", underline="single")
+        stmt = str(r.get("statement", "") or "")
+        n_lines = max(1, sum(max(1, math.ceil(len(p) / 78)) for p in stmt.split("\n")))
+        loc_lines = max(1, math.ceil(len(str(r.get("location", "") or "")) / 42))
+        ws.row_dimensions[rr].height = max(30, 15.5 * max(n_lines, loc_lines) + 6)
+
+    ws.freeze_panes = ws.cell(row=HR + 1, column=1)
+    ws.auto_filter.ref = f"A{HR}:{chr(64 + ncol)}{HR + max(len(rows), 1)}"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_title_rows = f"{HR}:{HR}"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def parse_reports_xlsx(data: bytes):
+    """يقرأ جدول سابق (نفس تنسيق build_reports_xlsx) عشان تكمل عليه. يرجع قائمة dict."""
+    from openpyxl import load_workbook
+    ws = load_workbook(io.BytesIO(data)).active
+    hdr_row, cols = None, {}
+    for r in range(1, 12):
+        vals = [str(c.value).strip() if c.value is not None else "" for c in ws[r]]
+        if "رقم النقطة" in vals:
+            hdr_row = r
+            cols = {name: idx + 1 for idx, name in enumerate(vals) if name}
+            break
+    if hdr_row is None:
+        raise ValueError("ما لقيت عمود «رقم النقطة» — لازم يكون الملف من نفس تنسيق جدول التقارير")
+    out = []
+    for r in range(hdr_row + 1, ws.max_row + 1):
+        def g(name):
+            c = ws.cell(row=r, column=cols[name]) if name in cols else None
+            return c
+        pid = g("رقم النقطة").value if g("رقم النقطة") is not None else None
+        if pid in (None, ""):
+            continue
+        try:
+            pid = int(float(pid))
+        except Exception:
+            continue
+        link = g("رابط الموقع")
+        url = ""
+        if link is not None:
+            url = (link.hyperlink.target if link.hyperlink is not None and link.hyperlink.target else link.value) or ""
+        def v(name):
+            c = g(name)
+            return "" if c is None or c.value is None else str(c.value)
+        out.append({"point_id": pid, "title": v("العنوان"), "unified": v("الرقم الموحد"), "location": v("الموقع"),
+                    "coords": v("الإحداثيات"), "url": str(url), "statement": v("الإفادة"), "date": v("تاريخ التقرير")})
+    return out
+
+
+
 def render_full_map(analysis, dpi=200, view=None, legend=None, point_label="نقطة التجمع",
-                    show_north=False, show_scale=False, aerial_opacity=1.0, streets=False):
-    """خريطة بالصورة الجوية تملأ كامل الصورة (A4 أفقي) + مفتاح خريطة فقط. يرجع (png, pdf)."""
+                    show_north=False, show_scale=False, aerial_opacity=1.0, streets=False,
+                    title="", statement=""):
+    """خريطة بالصورة الجوية تملأ الصفحة (A4 أفقي) + مفتاح خريطة. اختياريًا: عنوان بالأعلى وإفادة تحت الخريطة. يرجع (png, pdf)."""
     lat, lng = analysis["lat"], analysis["lng"]
     feats = analysis["features"]
     colors, labels = _legend_maps(feats, legend)
-    W_IN, H_IN = 11.69, 8.27
+    W_IN, H_IN = PAGE_W_IN, PAGE_H_IN
+    lay = _layout("full", title, statement)
     clat, clng, radius = _view_params(analysis, view)
-    bg, (ox, oy), z, mpp, tiles_ok = _aerial_background(clat, clng, radius, W_IN / H_IN, aerial_opacity, streets)
+    bg, (ox, oy), z, mpp, tiles_ok = _aerial_background(clat, clng, radius, lay["aspect"], aerial_opacity, streets)
     dlat_v = radius * 2 / 111320.0
     dlng_v = dlat_v / max(math.cos(math.radians(clat)), 0.2)
 
     plt.rcParams["font.family"] = "DejaVu Sans"
     fig = plt.figure(figsize=(W_IN, H_IN), dpi=dpi, facecolor="white")
-    ax = fig.add_axes([0, 0, 1, 1])
+    ax = fig.add_axes(list(lay["rect"]))
     ax.imshow(bg, extent=(0, bg.width, bg.height, 0), interpolation="bilinear", aspect="auto")
     ax.set_xlim(0, bg.width)
     ax.set_ylim(bg.height, 0)
@@ -693,21 +898,26 @@ def render_full_map(analysis, dpi=200, view=None, legend=None, point_label="نق
                 ha="center", va="bottom", fontsize=8.5, zorder=10)
 
     items = [(labels[c], colors[c]) for c in sorted(in_view)]
-    _draw_map_legend(fig, ax, (point_label or "").strip() or "نقطة التجمع", items)
+    _draw_map_legend(fig, ax, (point_label or "").strip() or "نقطة التجمع", items, ax_h_in=lay["rect"][3] * H_IN)
+    if lay["title_rect"]:
+        _draw_title_band(fig, lay["title_rect"], title)
+    if lay["stmt_rect"]:
+        _draw_statement(fig, lay["stmt_rect"], lay["lines"])
     return _fig_to_png_pdf(fig, dpi)
 
 
 
 def render_report(analysis, point_id, description, dpi=200, view=None, legend=None, point_label="نقطة التجمع",
-                  aerial_opacity=1.0, streets=False):
+                  aerial_opacity=1.0, streets=False, title="", statement=""):
     """يرجع (png_bytes, pdf_bytes): صفحة A4 أفقية على نمط خرائط ArcGIS:
     خريطة جوية كبيرة + عمود جانبي (خريطة موقع عامة، المصطلحات، الموضوع، علاقة الشبكة، مقياس الرسم)."""
     lat, lng = analysis["lat"], analysis["lng"]
     feats = analysis["features"]
     colors, labels = _legend_maps(feats, legend)
     near = analysis["nearest"]
-    W_IN, H_IN = 11.69, 8.27
-    MAP_L, MAP_B, MAP_W, MAP_H = 0.022, 0.03, 0.76, 0.94
+    W_IN, H_IN = PAGE_W_IN, PAGE_H_IN
+    lay = _layout("classic", title, statement)
+    MAP_L, MAP_B, MAP_W, MAP_H = lay["rect"]
     ax_w_in, ax_h_in = MAP_W * W_IN, MAP_H * H_IN
     aspect = ax_w_in / ax_h_in
 
@@ -767,8 +977,8 @@ def render_report(analysis, point_id, description, dpi=200, view=None, legend=No
     # ================= العمود الجانبي =================
     PL, PW = 0.79, 0.19
     gap = 0.008
-    heights = [0.30, 0.223, 0.15, 0.15, 0.085]
-    tops, y = [], 0.97
+    heights = [h_ * lay["f"] for h_ in (0.30, 0.223, 0.15, 0.15, 0.085)]
+    tops, y = [], lay["content_top"]
     for h in heights:
         tops.append(y)
         y -= h + gap
@@ -836,10 +1046,8 @@ def render_report(analysis, point_id, description, dpi=200, view=None, legend=No
         a5.text(bx0 + frac * seg * 4, 0.40, fmt(nice * frac), ha="center", va="top", fontsize=8)
     a5.text(0.5, 0.06, ar("كيلومتر" if unit_km else "متر"), ha="center", va="bottom", fontsize=9)
 
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=dpi, facecolor=fig.get_facecolor())
-    plt.close(fig)
-    png = buf.getvalue()
-    pdf_buf = io.BytesIO()
-    Image.open(io.BytesIO(png)).convert("RGB").save(pdf_buf, "PDF", resolution=dpi)
-    return png, pdf_buf.getvalue()
+    if lay["title_rect"]:
+        _draw_title_band(fig, lay["title_rect"], title)
+    if lay["stmt_rect"]:
+        _draw_statement(fig, lay["stmt_rect"], lay["lines"])
+    return _fig_to_png_pdf(fig, dpi)
